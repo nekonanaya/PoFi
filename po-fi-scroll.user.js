@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.9
-// @description  Adaptive exponential damping scroll with instant RAF positioning and Bilibili root scrollbar visibility
-// @author       Nyanyaya & 姐姐喵 &GPT龙娘
+// @version      1.2.10
+// @description  Adaptive exponential damping scroll with instant RAF positioning
+// @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nekonanaya/PoFi/main/po-fi-scroll.user.js
 // @downloadURL  https://raw.githubusercontent.com/nekonanaya/PoFi/main/po-fi-scroll.user.js
@@ -35,20 +35,22 @@
   const EPSILON = 0.5;
   const INSTANCE_KEY = '__POFI_HYDRAULIC_SCROLL__';
 
-  const BILI_SCROLLBAR_STYLE_ID =
-    'pofi-bilibili-root-scrollbar';
-
   const states = new WeakMap();
   const activeStates = new Set();
-
-  let scrollbarStyleObserver = null;
 
   // =========================================================
   // 2. INSTANCE CLEANUP
   // =========================================================
 
   if (typeof window[INSTANCE_KEY] === 'function') {
-    window[INSTANCE_KEY]();
+    try {
+      window[INSTANCE_KEY]();
+    } catch (error) {
+      console.warn(
+        '[Po-Fi] Previous instance cleanup failed:',
+        error
+      );
+    }
   }
 
   // =========================================================
@@ -383,75 +385,7 @@
   }
 
   // =========================================================
-  // 9. BILIBILI ROOT SCROLLBAR
-  // =========================================================
-
-  function installBilibiliRootScrollbar() {
-    if (location.hostname !== 'www.bilibili.com') {
-      return;
-    }
-
-    if (document.getElementById(BILI_SCROLLBAR_STYLE_ID)) {
-      return;
-    }
-
-    const style = document.createElement('style');
-    style.id = BILI_SCROLLBAR_STYLE_ID;
-
-    style.textContent = `
-      html:root {
-        scrollbar-width: auto !important;
-        scrollbar-color: auto !important;
-      }
-
-      html:root::-webkit-scrollbar {
-        width: 12px !important;
-        height: 12px !important;
-      }
-
-      html:root::-webkit-scrollbar-thumb {
-        background-color: rgba(128, 128, 128, 0.65) !important;
-        border: 3px solid transparent !important;
-        background-clip: padding-box !important;
-        border-radius: 999px !important;
-      }
-
-      html:root::-webkit-scrollbar-track {
-        background: transparent !important;
-      }
-    `;
-
-    const attach = () => {
-      const parent =
-        document.head || document.documentElement;
-
-      if (!parent) return false;
-
-      if (!document.getElementById(BILI_SCROLLBAR_STYLE_ID)) {
-        parent.appendChild(style);
-      }
-
-      if (scrollbarStyleObserver) {
-        scrollbarStyleObserver.disconnect();
-        scrollbarStyleObserver = null;
-      }
-
-      return true;
-    };
-
-    if (!attach()) {
-      scrollbarStyleObserver =
-        new MutationObserver(() => attach());
-
-      scrollbarStyleObserver.observe(document, {
-        childList: true,
-        subtree: true
-      });
-    }
-  }
-
-  // =========================================================
-  // 10. RAF ANIMATION
+  // 9. RAF ANIMATION
   // =========================================================
 
   function animate(state, time) {
@@ -530,7 +464,7 @@
   }
 
   // =========================================================
-  // 11. WHEEL HANDLER
+  // 10. WHEEL HANDLER
   // =========================================================
 
   function onWheel(event) {
@@ -606,10 +540,8 @@
   }
 
   // =========================================================
-  // 12. INITIALIZATION
+  // 11. INITIALIZATION
   // =========================================================
-
-  installBilibiliRootScrollbar();
 
   window.addEventListener('wheel', onWheel, {
     passive: false,
@@ -617,7 +549,7 @@
   });
 
   // =========================================================
-  // 13. CLEANUP
+  // 12. CLEANUP
   // =========================================================
 
   function cleanup() {
@@ -633,19 +565,6 @@
 
     activeStates.clear();
 
-    if (scrollbarStyleObserver) {
-      scrollbarStyleObserver.disconnect();
-      scrollbarStyleObserver = null;
-    }
-
-    const scrollbarStyle = document.getElementById(
-      BILI_SCROLLBAR_STYLE_ID
-    );
-
-    if (scrollbarStyle) {
-      scrollbarStyle.remove();
-    }
-
     if (window[INSTANCE_KEY] === cleanup) {
       delete window[INSTANCE_KEY];
     }
@@ -654,7 +573,7 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.9 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.10 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
     `Instant positioning enabled.`
   );
