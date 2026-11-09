@@ -24,8 +24,8 @@ The BetterNCM edition of Po-Fi Hydraulic Scroll is a personal adaptation, develo
 This release is provided as-is, without any commitment to ongoing maintenance, compatibility updates, bug fixes, or user support.  
 本发布按现状（As-Is）提供，不承诺任何后续的持续维护、兼容性更新、Bug 修复或用户支持。
 
-- Compatibility with other NetEase Cloud Music versions, BetterNCM versions, themes, and third-party plugins is not guaranteed.  
-  （不保证与其他网易云音乐版本、BetterNCM 版本、主题及第三方插件的兼容性。）
+- **Tested ONLY on NetEase Cloud Music v2.10.13.** Compatibility with other NCM versions, BetterNCM versions, themes, and third-party plugins is neither tested nor guaranteed.  
+  （**仅在网易云音乐 v2.10.13 版本进行过测试。**不保证与其他网易云版本、BetterNCM 版本、主题及第三方插件的兼容性，也未做过相关测试。）
 - No automatic updates or compatibility guarantees are provided.  
   （不提供自动更新或兼容性担保。）
 - Issues and feedback are welcome, but responses or fixes are not guaranteed.  
