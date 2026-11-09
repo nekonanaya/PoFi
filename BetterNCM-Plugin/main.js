@@ -2,6 +2,7 @@
   'use strict';
 
   // Po-Fi Hydraulic Scroll for BetterNCM
+  // Version 1.2.1: yield wheel events to the NCM playback lyric area
   // Engine baseline: Po-Fi browser userscript 1.2.0
   // Time constant: 45 ms. No animation frame runs while idle.
 
@@ -74,6 +75,9 @@
       if (!(node instanceof Element)) continue;
 
       if (
+        // Let the playback-page lyric component handle its own wheel events.
+        // This is deliberately scoped to the observed NCM DOM path.
+        node.matches('.g-singlec-ct .n-single .lyric, .g-singlec-ct .n-single .rnp-lyrics') ||
         node.hasAttribute('data-pofi-native-scroll') ||
         node.matches('input, textarea, select, [role="textbox"]') ||
         node.isContentEditable
@@ -257,5 +261,5 @@
 
   window[INSTANCE_KEY] = cleanup;
 
-  console.info(`[Po-Fi] BetterNCM extension loaded. τ=${TAU_MS}ms`);
+  console.info(`[Po-Fi] BetterNCM extension 1.2.1 loaded. τ=${TAU_MS}ms`);
 })();
