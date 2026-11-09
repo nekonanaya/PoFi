@@ -13,6 +13,25 @@ A global exponential damping scroll script / plugin based on true physical time 
 
 ---
 
+## Troubleshooting / 战地排雷指南
+
+### BetterNCM Hook Cache Reset (底层物理重置)
+If you encounter unexpected visual glitches, hook conflicts, or partial theme UI failures after installation:  
+如果在安装后遇到偶发性视觉异常、与主题冲突或部分界面未生效：
+
+1. **Clear Hijack Cache (清除缓存)**: Go to BetterNCM Settings and clear the Hijack cache.  
+   *(进入 BetterNCM 设置，点击清除 Hijack 缓存。)*
+2. **Remove Plugin (移出插件)**: Move `PoFi-Hydraulic-Scroll.plugin` out of your `plugins` directory.  
+   *(将本插件移出 `plugins` 文件夹。)*
+3. **Restart NCM (首次重启)**: Restart NetEase Cloud Music completely.  
+   *(彻底重启一次网易云音乐，使宿主环境归零。)*
+4. **Restore Plugin (放回插件)**: Place the `.plugin` file back into the `plugins` directory.  
+   *(重新将本插件放入 `plugins` 文件夹。)*
+5. **Final Restart (再次重启)**: Restart NCM one more time to cleanly re-anchor all hooks.  
+   *(再次重启网易云，完成纯净的物理 Hook 重新挂载。)*
+   
+---
+
 ## Maintenance Status / 维护声明
 
 **Status: Unmaintained / As-Is Release**  
