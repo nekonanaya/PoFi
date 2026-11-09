@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/BetterNCM/BetterNCM-Plugins/refs/heads/master/manifest-schema.json",
+  "manifest_version": 1,
+  "name": "Po-Fi Hydraulic Scroll",
+  "slug": "pofi-hydraulic-scroll",
+  "version": "1.2.0",
+  "author": "Nyanyaya",
+  "author_link": "https://github.com/nekonanaya/PoFI",
+  "description": "为网易云音乐主页面提供独立滚动容器的指数阻尼滚动。",
+  "betterncm_version": ">=0.2.5",
+  "type": "extension",
+  "require_restart": true,
+  "injects": {
+    "Main": [
+      {
+        "file": "main.js"
+      }
+    ]
+  }
+}
