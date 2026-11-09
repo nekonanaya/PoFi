@@ -4,6 +4,19 @@ A smooth hydraulic damping scroll script / plugin with speed-adaptive physics, d
 
 带来如液压旋钮般丝滑阻尼感的滚动脚本 / 插件。采用速度自适应算法，彻底告别生硬跳动、滚轮卡顿与网页眩晕感。
 
+
+### 🎬 Browser | 浏览器
+
+**Before | Native Scrolling**
+
+[Crema3.webm](https://github.com/user-attachments/assets/4ef8efbd-04ae-4aef-b7c1-fcad2d85e8e3)
+
+**After | Po-Fi Hydraulic Scroll**
+
+[Crema2.webm](https://github.com/user-attachments/assets/2a2b5060-9156-4aae-88b1-da2ab8fad4e5)
+
+——————————
+
 ## 🎬 Po-Fi Hydraulic Scroll | Before & After
 
 展示原生滚动与 Po-Fi 液压阻尼滚动的实际效果对比。
