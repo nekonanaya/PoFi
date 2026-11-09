@@ -1,8 +1,8 @@
 # PoFi Hydraulic Scroll
 
-A global exponential damping scroll script / plugin based on true physical time constants ($\tau=45ms$), designed to eliminate motion sickness and rigid scrolling jumps.
+A smooth hydraulic damping scroll script / plugin with speed-adaptive physics, designed to eliminate scrolling stutter and motion sickness.
 
-基于真实物理时间常数（$\tau=45ms$）的帧率解耦液压阻尼平滑滚动脚本 / 插件，旨在消除晕车感与生硬的滚动跳跃。
+带来如液压旋钮般丝滑阻尼感的滚动脚本 / 插件。采用速度自适应算法，彻底告别生硬跳动、滚轮卡顿与网页眩晕感。
 
 ## Installation / 安装方式
 
