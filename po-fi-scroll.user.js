@@ -3,7 +3,7 @@
 // @namespace    https://github.com/nekonanaya/PoFi
 // @version      1.2.9
 // @description  Adaptive exponential damping scroll with instant RAF positioning and Bilibili root scrollbar visibility
-// @author       Nyanyaya & 姐姐喵
+// @author       Nyanyaya & 姐姐喵 &GPT龙娘
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nekonanaya/PoFi/main/po-fi-scroll.user.js
 // @downloadURL  https://raw.githubusercontent.com/nekonanaya/PoFi/main/po-fi-scroll.user.js
