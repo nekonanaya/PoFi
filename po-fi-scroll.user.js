@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.10
-// @description  Adaptive exponential damping scroll with instant RAF positioning
+// @version      1.2.12
+// @description  Adaptive exponential damping scroll with instant RAF positioning and GPU overlay indicator
 // @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nekonanaya/PoFi/main/po-fi-scroll.user.js
@@ -33,10 +33,25 @@
 
   const LINE_SIZE = 40;
   const EPSILON = 0.5;
+  const BOUNDARY_EPSILON = 1.5;
+  const INDICATOR_HIDE_DELAY_MS = 900;
+  const INDICATOR_PADDING_PX = 4;
+  const INDICATOR_MIN_THUMB_PX = 28;
   const INSTANCE_KEY = '__POFI_HYDRAULIC_SCROLL__';
+
+  const NAV_KEYS = new Set([
+    'PageUp',
+    'PageDown',
+    'Home',
+    'End',
+    'ArrowUp',
+    'ArrowDown',
+    ' '
+  ]);
 
   const states = new WeakMap();
   const activeStates = new Set();
+  let supportsInstantBehavior = true;
 
   // =========================================================
   // 2. INSTANCE CLEANUP
@@ -63,18 +78,35 @@
   }
 
   function isRoot(container) {
-    return container === getRoot() ||
-      container === document.documentElement ||
-      container === document.body;
+    const root = getRoot();
+    return container === root ||
+      (container === document.documentElement && root === document.documentElement);
   }
 
   function normalizeContainer(container) {
     return isRoot(container) ? getRoot() : container;
   }
 
+  function getScrollTop(container) {
+    if (isRoot(container)) {
+      return window.scrollY ?? window.pageYOffset ?? container.scrollTop;
+    }
+
+    return container.scrollTop;
+  }
+
+  function getViewportHeight(container) {
+    return isRoot(container)
+      ? (container.clientHeight || window.innerHeight)
+      : container.clientHeight;
+  }
+
   function getMaxScroll(container) {
-    const height =
-      container.clientHeight || window.innerHeight;
+    const height = getViewportHeight(container);
+
+    if (height <= 0) {
+      return 0;
+    }
 
     return Math.max(
       0,
@@ -82,22 +114,43 @@
     );
   }
 
-  function isScrollable(container) {
+  function isRootOverflowLocked() {
+    const html = document.documentElement;
+    const body = document.body;
+
+    const htmlOverflow = html
+      ? getComputedStyle(html).overflowY
+      : 'visible';
+
+    if (htmlOverflow === 'hidden' || htmlOverflow === 'clip') {
+      return true;
+    }
+
+    if (htmlOverflow === 'visible' && body) {
+      const bodyOverflow = getComputedStyle(body).overflowY;
+      if (bodyOverflow === 'hidden' || bodyOverflow === 'clip') {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function isScrollable(container, style) {
     if (!container || !container.isConnected) {
       return false;
     }
 
-    // The document root is special:
-    // its computed overflowY may be "visible".
     if (isRoot(container)) {
-      return getMaxScroll(container) > 1;
+      return !isRootOverflowLocked() &&
+        getMaxScroll(container) > BOUNDARY_EPSILON;
     }
 
     const overflowY =
-      getComputedStyle(container).overflowY;
+      (style || getComputedStyle(container)).overflowY;
 
     return /^(auto|scroll|overlay)$/.test(overflowY) &&
-      getMaxScroll(container) > 1;
+      getMaxScroll(container) > BOUNDARY_EPSILON;
   }
 
   function clamp(value, min, max) {
@@ -108,7 +161,334 @@
   }
 
   // =========================================================
-  // 4. INPUT FILTERING
+  // 4. GPU FLOATING OVERLAY SCROLLBAR (SHADOW DOM)
+  // =========================================================
+
+  const indicator = {
+    host: null,
+    track: null,
+    thumbHit: null,
+    pill: null,
+
+    container: null,
+    rectTop: 0,
+    rectRight: 0,
+    rectHeight: 0,
+
+    maxScroll: 0,
+    viewportHeight: 0,
+    usableHeight: 0,
+    thumbHeight: 0,
+    lastThumbHeight: -1,
+
+    visible: false,
+    hovering: false,
+    dragging: false,
+    dragStartY: 0,
+    dragStartScrollTop: 0,
+    hideTimer: 0
+  };
+
+  function ensureIndicator() {
+    if (indicator.host) {
+      return true;
+    }
+
+    const mountTarget = document.documentElement;
+    if (!mountTarget) {
+      return false;
+    }
+
+    const host = document.createElement('div');
+    host.setAttribute('data-pofi-indicator', 'true');
+    host.style.cssText =
+      'position:fixed;inset:0;pointer-events:none;' +
+      'z-index:2147483647;contain:layout style;';
+
+    const shadow = host.attachShadow({ mode: 'closed' });
+
+    const style = document.createElement('style');
+    style.textContent = `
+      .track {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 14px;
+        height: 0;
+        pointer-events: none;
+      }
+      .thumb-hit {
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 14px;
+        min-height: 28px;
+        opacity: 0;
+        pointer-events: none;
+        will-change: transform, opacity;
+        transition: opacity 0.2s ease;
+        cursor: default;
+        touch-action: none;
+      }
+      .pill {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        right: 3px;
+        width: 4px;
+        border-radius: 999px;
+        background: rgba(128, 128, 136, 0.56);
+        box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.3);
+        transition: width 0.14s ease, background 0.14s ease, right 0.14s ease;
+      }
+      .thumb-hit:hover .pill,
+      .thumb-hit.dragging .pill {
+        width: 7px;
+        right: 2px;
+        background: rgba(128, 128, 136, 0.82);
+      }
+    `;
+
+    const track = document.createElement('div');
+    track.className = 'track';
+
+    const thumbHit = document.createElement('div');
+    thumbHit.className = 'thumb-hit';
+
+    const pill = document.createElement('div');
+    pill.className = 'pill';
+
+    thumbHit.appendChild(pill);
+    track.appendChild(thumbHit);
+    shadow.appendChild(style);
+    shadow.appendChild(track);
+    mountTarget.appendChild(host);
+
+    thumbHit.addEventListener('pointerenter', () => {
+      indicator.hovering = true;
+      clearHideTimer();
+    });
+
+    thumbHit.addEventListener('pointerleave', () => {
+      indicator.hovering = false;
+      if (!indicator.dragging) {
+        scheduleHideIndicator();
+      }
+    });
+
+    thumbHit.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || !indicator.container || !indicator.container.isConnected) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const container = indicator.container;
+      const state = states.get(container);
+      if (state) {
+        finishState(state);
+      }
+
+      indicator.dragging = true;
+      indicator.dragStartY = event.clientY;
+      indicator.dragStartScrollTop = getScrollTop(container);
+      indicator.maxScroll = getMaxScroll(container);
+      indicator.viewportHeight = getViewportHeight(container);
+      thumbHit.classList.add('dragging');
+      clearHideTimer();
+
+      try {
+        thumbHit.setPointerCapture(event.pointerId);
+      } catch {}
+    });
+
+    thumbHit.addEventListener('pointermove', event => {
+      if (!indicator.dragging || !indicator.container) {
+        return;
+      }
+
+      const scrollRange = indicator.usableHeight - indicator.thumbHeight;
+      if (scrollRange <= 0 || indicator.maxScroll <= 0) {
+        return;
+      }
+
+      const deltaY = event.clientY - indicator.dragStartY;
+      const scrollDelta = deltaY * (indicator.maxScroll / scrollRange);
+      const nextTop = clamp(
+        indicator.dragStartScrollTop + scrollDelta,
+        0,
+        indicator.maxScroll
+      );
+
+      setScrollPositionInstant(indicator.container, nextTop);
+      renderIndicator(
+        indicator.container,
+        nextTop,
+        indicator.maxScroll,
+        indicator.viewportHeight
+      );
+    });
+
+    const endDrag = event => {
+      if (!indicator.dragging) {
+        return;
+      }
+
+      indicator.dragging = false;
+      thumbHit.classList.remove('dragging');
+
+      try {
+        if (thumbHit.hasPointerCapture(event.pointerId)) {
+          thumbHit.releasePointerCapture(event.pointerId);
+        }
+      } catch {}
+
+      if (!indicator.hovering) {
+        scheduleHideIndicator();
+      }
+    };
+
+    thumbHit.addEventListener('pointerup', endDrag);
+    thumbHit.addEventListener('pointercancel', endDrag);
+
+    indicator.host = host;
+    indicator.track = track;
+    indicator.thumbHit = thumbHit;
+    indicator.pill = pill;
+
+    return true;
+  }
+
+  function clearHideTimer() {
+    if (indicator.hideTimer) {
+      clearTimeout(indicator.hideTimer);
+      indicator.hideTimer = 0;
+    }
+  }
+
+  function hideIndicator() {
+    clearHideTimer();
+    indicator.visible = false;
+
+    if (indicator.thumbHit) {
+      indicator.thumbHit.style.opacity = '0';
+      indicator.thumbHit.style.pointerEvents = 'none';
+    }
+  }
+
+  function scheduleHideIndicator() {
+    clearHideTimer();
+
+    if (indicator.hovering || indicator.dragging) {
+      return;
+    }
+
+    indicator.hideTimer = setTimeout(() => {
+      indicator.hideTimer = 0;
+      hideIndicator();
+    }, INDICATOR_HIDE_DELAY_MS);
+  }
+
+  function refreshIndicatorTrack(container) {
+    if (!ensureIndicator()) {
+      return;
+    }
+
+    indicator.container = container;
+
+    if (isRoot(container)) {
+      indicator.rectTop = 0;
+      indicator.rectRight = window.innerWidth;
+      indicator.rectHeight = window.innerHeight;
+    } else {
+      const rect = container.getBoundingClientRect();
+      indicator.rectTop = rect.top;
+      indicator.rectRight = rect.right;
+      indicator.rectHeight = rect.height;
+    }
+
+    indicator.track.style.transform =
+      `translate3d(${(indicator.rectRight - 14).toFixed(1)}px,${indicator.rectTop.toFixed(1)}px,0)`;
+    indicator.track.style.height = `${Math.max(0, indicator.rectHeight).toFixed(1)}px`;
+  }
+
+  function renderIndicator(container, currentY, maxScroll, viewportHeight) {
+    if (!indicator.host || indicator.container !== container) {
+      return;
+    }
+
+    if (
+      maxScroll <= BOUNDARY_EPSILON ||
+      viewportHeight <= 0 ||
+      indicator.rectHeight < 40
+    ) {
+      hideIndicator();
+      return;
+    }
+
+    const scrollHeight = maxScroll + viewportHeight;
+    const usableHeight = Math.max(0, indicator.rectHeight - INDICATOR_PADDING_PX * 2);
+
+    if (usableHeight <= INDICATOR_MIN_THUMB_PX) {
+      hideIndicator();
+      return;
+    }
+
+    const thumbHeight = clamp(
+      (viewportHeight / scrollHeight) * usableHeight,
+      INDICATOR_MIN_THUMB_PX,
+      usableHeight
+    );
+
+    const progress = clamp(currentY / maxScroll, 0, 1);
+    const thumbY =
+      INDICATOR_PADDING_PX +
+      progress * (usableHeight - thumbHeight);
+
+    indicator.maxScroll = maxScroll;
+    indicator.viewportHeight = viewportHeight;
+    indicator.usableHeight = usableHeight;
+    indicator.thumbHeight = thumbHeight;
+
+    if (Math.abs(thumbHeight - indicator.lastThumbHeight) > 0.3) {
+      indicator.thumbHit.style.height = `${thumbHeight.toFixed(1)}px`;
+      indicator.lastThumbHeight = thumbHeight;
+    }
+
+    indicator.thumbHit.style.transform =
+      `translate3d(0,${thumbY.toFixed(2)}px,0)`;
+
+    if (!indicator.visible) {
+      indicator.visible = true;
+      indicator.thumbHit.style.opacity = '1';
+      indicator.thumbHit.style.pointerEvents = 'auto';
+    }
+
+    if (!indicator.dragging) {
+      scheduleHideIndicator();
+    }
+  }
+
+  function destroyIndicator() {
+    clearHideTimer();
+
+    if (indicator.host && indicator.host.parentNode) {
+      indicator.host.parentNode.removeChild(indicator.host);
+    }
+
+    indicator.host = null;
+    indicator.track = null;
+    indicator.thumbHit = null;
+    indicator.pill = null;
+    indicator.container = null;
+    indicator.visible = false;
+    indicator.hovering = false;
+    indicator.dragging = false;
+  }
+
+  // =========================================================
+  // 5. INPUT FILTERING
   // =========================================================
 
   function shouldIgnore(event, path) {
@@ -138,10 +518,15 @@
         node.hasAttribute('data-pofi-native-scroll') ||
 
         node.matches(
-          'input, textarea, select, [role="textbox"]'
-        ) ||
+          'select, input[type="number"], input[type="range"]'
+        )
+      ) {
+        return true;
+      }
 
-        node.isContentEditable
+      if (
+        (node.matches('textarea, [role="textbox"]') || node.isContentEditable) &&
+        node.scrollHeight > node.clientHeight + BOUNDARY_EPSILON
       ) {
         return true;
       }
@@ -190,15 +575,14 @@
     }
 
     if (event.deltaMode === 2) {
-      return event.deltaY *
-        (container.clientHeight || window.innerHeight);
+      return event.deltaY * getViewportHeight(container);
     }
 
     return event.deltaY;
   }
 
   // =========================================================
-  // 5. ADAPTIVE HYDRAULIC DAMPING
+  // 6. ADAPTIVE HYDRAULIC DAMPING
   // =========================================================
 
   function getAdaptiveTau(inputSpeed) {
@@ -208,8 +592,6 @@
       1
     );
 
-    // Smoothstep interpolation:
-    // continuous transition without abrupt parameter switching.
     const curve =
       normalized * normalized *
       (3 - 2 * normalized);
@@ -223,7 +605,6 @@
       ? now - state.lastWheelTime
       : 16;
 
-    // Start a fresh input sequence after idle.
     if (elapsed > SPEED_RESET_MS) {
       state.inputSpeed = 0;
       elapsed = 16;
@@ -248,7 +629,6 @@
         -filterDt / SPEED_FILTER_MS
       );
 
-    // Low-pass filtering prevents damping jitter.
     state.inputSpeed +=
       (
         instantaneousSpeed -
@@ -263,12 +643,14 @@
   }
 
   // =========================================================
-  // 6. SCROLL CONTAINER SELECTION
+  // 7. SCROLL CONTAINER SELECTION
   // =========================================================
 
   function findScrollableContainer(candidates, direction) {
     for (const container of candidates) {
-      if (!isScrollable(container)) continue;
+      const style = getComputedStyle(container);
+
+      if (!isScrollable(container, style)) continue;
 
       const maxScroll = getMaxScroll(container);
       const state = states.get(container);
@@ -276,20 +658,17 @@
       const current =
         state && state.raf
           ? state.targetY
-          : container.scrollTop;
+          : getScrollTop(container);
 
       const canScrollDown =
         direction > 0 &&
-        maxScroll - current > EPSILON;
+        maxScroll - current > BOUNDARY_EPSILON;
 
       const canScrollUp =
         direction < 0 &&
-        current > EPSILON;
+        current > BOUNDARY_EPSILON;
 
       if (canScrollDown || canScrollUp) {
-        const style = getComputedStyle(container);
-
-        // Preserve intentional scroll-snap behavior.
         if (style.scrollSnapType !== 'none') {
           return null;
         }
@@ -297,9 +676,7 @@
         return container;
       }
 
-      // Respect explicit scroll-chain boundaries.
-      const overscroll =
-        getComputedStyle(container).overscrollBehaviorY;
+      const overscroll = style.overscrollBehaviorY;
 
       if (
         overscroll === 'contain' ||
@@ -313,14 +690,14 @@
   }
 
   // =========================================================
-  // 7. STATE MANAGEMENT
+  // 8. STATE MANAGEMENT
   // =========================================================
 
   function getState(container) {
     let state = states.get(container);
 
     if (!state) {
-      const current = container.scrollTop;
+      const current = getScrollTop(container);
 
       state = {
         container,
@@ -331,7 +708,6 @@
         lastTime: 0,
         raf: 0,
 
-        // Adaptive damping state.
         inputSpeed: 0,
         tauMs: TAU_MIN_MS,
         lastWheelTime: 0
@@ -362,30 +738,39 @@
   }
 
   // =========================================================
-  // 8. INSTANT SCROLL POSITIONING
+  // 9. INSTANT SCROLL POSITIONING
   // =========================================================
 
   function setScrollPositionInstant(container, top) {
-    // Route root scrolling through the viewport.
-    if (isRoot(container)) {
-      window.scrollTo({
-        top,
-        behavior: 'instant'
-      });
+    if (supportsInstantBehavior) {
+      try {
+        if (isRoot(container)) {
+          window.scrollTo({
+            top,
+            behavior: 'instant'
+          });
+          return;
+        }
 
-      return;
+        container.scrollTo({
+          top,
+          behavior: 'instant'
+        });
+        return;
+      } catch {
+        supportsInstantBehavior = false;
+      }
     }
 
-    // Prevent the site's scroll-behavior:smooth
-    // from starting a competing animation.
-    container.scrollTo({
-      top,
-      behavior: 'instant'
-    });
+    if (isRoot(container)) {
+      window.scrollTo(window.scrollX, top);
+    } else {
+      container.scrollTop = top;
+    }
   }
 
   // =========================================================
-  // 9. RAF ANIMATION
+  // 10. RAF ANIMATION
   // =========================================================
 
   function animate(state, time) {
@@ -408,10 +793,10 @@
 
     state.lastTime = time;
 
-    // Re-read geometry during animation.
-    // This preserves correctness when dynamic page content
-    // changes the scrollable height.
-    const maxScroll = getMaxScroll(container);
+    const viewportHeight = getViewportHeight(container);
+    const maxScroll = viewportHeight > 0
+      ? Math.max(0, container.scrollHeight - viewportHeight)
+      : 0;
 
     state.targetY = clamp(
       state.targetY,
@@ -419,7 +804,6 @@
       maxScroll
     );
 
-    // Adaptive exponential damping.
     const alpha =
       1 - Math.exp(
         -dt / state.tauMs
@@ -437,17 +821,24 @@
       maxScroll
     );
 
-    setScrollPositionInstant(
-      container,
-      state.currentY
-    );
-
     if (
       Math.abs(
         state.targetY -
         state.currentY
       ) > EPSILON
     ) {
+      setScrollPositionInstant(
+        container,
+        state.currentY
+      );
+
+      renderIndicator(
+        container,
+        state.currentY,
+        maxScroll,
+        viewportHeight
+      );
+
       state.raf = requestAnimationFrame(
         nextTime => animate(state, nextTime)
       );
@@ -459,12 +850,19 @@
 
       state.currentY = state.targetY;
 
+      renderIndicator(
+        container,
+        state.targetY,
+        maxScroll,
+        viewportHeight
+      );
+
       finishState(state);
     }
   }
 
   // =========================================================
-  // 10. WHEEL HANDLER
+  // 11. WHEEL & KEYBOARD HANDLERS
   // =========================================================
 
   function onWheel(event) {
@@ -499,8 +897,9 @@
     const state = getState(container);
 
     if (!state.raf) {
-      state.currentY = container.scrollTop;
-      state.targetY = container.scrollTop;
+      const current = getScrollTop(container);
+      state.currentY = current;
+      state.targetY = current;
       state.lastTime = 0;
     }
 
@@ -520,7 +919,6 @@
       return;
     }
 
-    // Only accepted scroll input affects adaptive damping.
     updateAdaptiveDamping(
       state,
       delta,
@@ -529,6 +927,7 @@
 
     event.preventDefault();
     state.targetY = nextTarget;
+    refreshIndicatorTrack(container);
 
     if (!state.raf) {
       activeStates.add(state);
@@ -539,8 +938,26 @@
     }
   }
 
+  function onKeyDown(event) {
+    if (!activeStates.size || !NAV_KEYS.has(event.key)) {
+      return;
+    }
+
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      (target.matches('input, textarea, select, [role="textbox"]') || target.isContentEditable)
+    ) {
+      return;
+    }
+
+    for (const state of [...activeStates]) {
+      finishState(state);
+    }
+  }
+
   // =========================================================
-  // 11. INITIALIZATION
+  // 12. INITIALIZATION
   // =========================================================
 
   window.addEventListener('wheel', onWheel, {
@@ -548,8 +965,13 @@
     capture: true
   });
 
+  window.addEventListener('keydown', onKeyDown, {
+    passive: true,
+    capture: true
+  });
+
   // =========================================================
-  // 12. CLEANUP
+  // 13. CLEANUP
   // =========================================================
 
   function cleanup() {
@@ -559,11 +981,18 @@
       true
     );
 
+    window.removeEventListener(
+      'keydown',
+      onKeyDown,
+      true
+    );
+
     for (const state of [...activeStates]) {
       finishState(state);
     }
 
     activeStates.clear();
+    destroyIndicator();
 
     if (window[INSTANCE_KEY] === cleanup) {
       delete window[INSTANCE_KEY];
@@ -573,8 +1002,8 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.10 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.12 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
-    `Instant positioning enabled.`
+    `GPU overlay indicator enabled.`
   );
 })();
