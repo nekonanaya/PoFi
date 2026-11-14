@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.12
-// @description  Adaptive exponential damping scroll with instant RAF positioning and GPU overlay indicator
+// @version      1.2.14
+// @description  Adaptive exponential damping scroll with instant RAF positioning and floating overlay indicator
 // @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nekonanaya/PoFi/main/po-fi-scroll.user.js
@@ -34,7 +34,19 @@
   const LINE_SIZE = 40;
   const EPSILON = 0.5;
   const BOUNDARY_EPSILON = 1.5;
+
+  // Floating overlay indicator config.
+  const INDICATOR_ENABLED = true;
+  // 'exclude': enabled everywhere except INDICATOR_HOSTS.
+  // 'include': enabled only on INDICATOR_HOSTS.
+  const INDICATOR_MODE = 'exclude';
+  const INDICATOR_HOSTS = [
+    // 'example.com'
+  ];
+
   const INDICATOR_HIDE_DELAY_MS = 900;
+  const INDICATOR_FADE_CLEANUP_MS = 240;
+  const INDICATOR_TRACK_REFRESH_MS = 120;
   const INDICATOR_PADDING_PX = 4;
   const INDICATOR_MIN_THUMB_PX = 28;
   const INSTANCE_KEY = '__POFI_HYDRAULIC_SCROLL__';
@@ -54,7 +66,7 @@
   let supportsInstantBehavior = true;
 
   // =========================================================
-  // 2. INSTANCE CLEANUP
+  // 2. INSTANCE CLEANUP & HOST FILTERING
   // =========================================================
 
   if (typeof window[INSTANCE_KEY] === 'function') {
@@ -67,6 +79,36 @@
       );
     }
   }
+
+  function matchesHostPattern(hostname, pattern) {
+    const cleanHost = hostname.toLowerCase();
+    const cleanPattern = String(pattern)
+      .trim()
+      .toLowerCase()
+      .replace(/^\*\./, '');
+
+    if (!cleanPattern) {
+      return false;
+    }
+
+    return cleanHost === cleanPattern ||
+      cleanHost.endsWith(`.${cleanPattern}`);
+  }
+
+  function checkIndicatorAllowed() {
+    if (!INDICATOR_ENABLED) {
+      return false;
+    }
+
+    const hostname = location.hostname;
+    const matched = INDICATOR_HOSTS.some(
+      pattern => matchesHostPattern(hostname, pattern)
+    );
+
+    return INDICATOR_MODE === 'include' ? matched : !matched;
+  }
+
+  const INDICATOR_ALLOWED = checkIndicatorAllowed();
 
   // =========================================================
   // 3. SCROLL CONTAINER UTILITIES
@@ -161,7 +203,7 @@
   }
 
   // =========================================================
-  // 4. GPU FLOATING OVERLAY SCROLLBAR (SHADOW DOM)
+  // 4. FLOATING OVERLAY SCROLLBAR (SHADOW DOM)
   // =========================================================
 
   const indicator = {
@@ -174,6 +216,9 @@
     rectTop: 0,
     rectRight: 0,
     rectHeight: 0,
+    lastTrackTime: 0,
+    lastTrackTransform: '',
+    lastTrackHeight: '',
 
     maxScroll: 0,
     viewportHeight: 0,
@@ -186,10 +231,15 @@
     dragging: false,
     dragStartY: 0,
     dragStartScrollTop: 0,
-    hideTimer: 0
+    hideTimer: 0,
+    cleanupTimer: 0
   };
 
   function ensureIndicator() {
+    if (!INDICATOR_ALLOWED) {
+      return false;
+    }
+
     if (indicator.host) {
       return true;
     }
@@ -224,8 +274,9 @@
         width: 14px;
         min-height: 28px;
         opacity: 0;
+        visibility: hidden;
         pointer-events: none;
-        will-change: transform, opacity;
+        will-change: auto;
         transition: opacity 0.2s ease;
         cursor: default;
         touch-action: none;
@@ -266,12 +317,12 @@
 
     thumbHit.addEventListener('pointerenter', () => {
       indicator.hovering = true;
-      clearHideTimer();
+      clearIndicatorTimers();
     });
 
     thumbHit.addEventListener('pointerleave', () => {
       indicator.hovering = false;
-      if (!indicator.dragging) {
+      if (!indicator.dragging && !isIndicatorAnimating()) {
         scheduleHideIndicator();
       }
     });
@@ -284,19 +335,20 @@
       event.preventDefault();
       event.stopPropagation();
 
-      const container = indicator.container;
-      const state = states.get(container);
-      if (state) {
-        finishState(state);
-      }
-
       indicator.dragging = true;
       indicator.dragStartY = event.clientY;
-      indicator.dragStartScrollTop = getScrollTop(container);
-      indicator.maxScroll = getMaxScroll(container);
-      indicator.viewportHeight = getViewportHeight(container);
+      indicator.dragStartScrollTop = getScrollTop(indicator.container);
+      indicator.maxScroll = getMaxScroll(indicator.container);
+      indicator.viewportHeight = getViewportHeight(indicator.container);
       thumbHit.classList.add('dragging');
-      clearHideTimer();
+      clearIndicatorTimers();
+
+      const state = states.get(indicator.container);
+      if (state) {
+        finishState(state, {
+          resetVelocity: true
+        });
+      }
 
       try {
         thumbHit.setPointerCapture(event.pointerId);
@@ -344,7 +396,9 @@
         }
       } catch {}
 
-      if (!indicator.hovering) {
+      indicator.hovering = thumbHit.matches(':hover');
+
+      if (!indicator.hovering && !isIndicatorAnimating()) {
         scheduleHideIndicator();
       }
     };
@@ -360,27 +414,53 @@
     return true;
   }
 
-  function clearHideTimer() {
+  function isIndicatorAnimating() {
+    if (!indicator.container) {
+      return false;
+    }
+
+    const state = states.get(indicator.container);
+    return Boolean(state && state.raf);
+  }
+
+  function clearIndicatorTimers() {
     if (indicator.hideTimer) {
       clearTimeout(indicator.hideTimer);
       indicator.hideTimer = 0;
     }
+
+    if (indicator.cleanupTimer) {
+      clearTimeout(indicator.cleanupTimer);
+      indicator.cleanupTimer = 0;
+    }
   }
 
   function hideIndicator() {
-    clearHideTimer();
+    clearIndicatorTimers();
     indicator.visible = false;
 
     if (indicator.thumbHit) {
       indicator.thumbHit.style.opacity = '0';
       indicator.thumbHit.style.pointerEvents = 'none';
+
+      indicator.cleanupTimer = setTimeout(() => {
+        indicator.cleanupTimer = 0;
+        if (!indicator.visible && indicator.thumbHit) {
+          indicator.thumbHit.style.willChange = 'auto';
+          indicator.thumbHit.style.visibility = 'hidden';
+        }
+      }, INDICATOR_FADE_CLEANUP_MS);
     }
   }
 
   function scheduleHideIndicator() {
-    clearHideTimer();
+    if (!indicator.visible && !indicator.hideTimer) {
+      return;
+    }
 
-    if (indicator.hovering || indicator.dragging) {
+    clearIndicatorTimers();
+
+    if (indicator.hovering || indicator.dragging || isIndicatorAnimating()) {
       return;
     }
 
@@ -390,12 +470,33 @@
     }, INDICATOR_HIDE_DELAY_MS);
   }
 
-  function refreshIndicatorTrack(container) {
+  function refreshIndicatorTrack(container, force = false) {
     if (!ensureIndicator()) {
       return;
     }
 
-    indicator.container = container;
+    clearIndicatorTimers();
+    indicator.thumbHit.style.visibility = 'visible';
+    indicator.thumbHit.style.willChange = 'transform, opacity';
+
+    const containerChanged = indicator.container !== container;
+    if (containerChanged) {
+      indicator.hovering = false;
+      indicator.container = container;
+    }
+
+    const now = performance.now();
+    const shouldMeasure =
+      force ||
+      containerChanged ||
+      !indicator.visible ||
+      now - indicator.lastTrackTime > INDICATOR_TRACK_REFRESH_MS;
+
+    if (!shouldMeasure) {
+      return;
+    }
+
+    indicator.lastTrackTime = now;
 
     if (isRoot(container)) {
       indicator.rectTop = 0;
@@ -408,13 +509,23 @@
       indicator.rectHeight = rect.height;
     }
 
-    indicator.track.style.transform =
+    const nextTransform =
       `translate3d(${(indicator.rectRight - 14).toFixed(1)}px,${indicator.rectTop.toFixed(1)}px,0)`;
-    indicator.track.style.height = `${Math.max(0, indicator.rectHeight).toFixed(1)}px`;
+    const nextHeight = `${Math.max(0, indicator.rectHeight).toFixed(1)}px`;
+
+    if (nextTransform !== indicator.lastTrackTransform) {
+      indicator.track.style.transform = nextTransform;
+      indicator.lastTrackTransform = nextTransform;
+    }
+
+    if (nextHeight !== indicator.lastTrackHeight) {
+      indicator.track.style.height = nextHeight;
+      indicator.lastTrackHeight = nextHeight;
+    }
   }
 
   function renderIndicator(container, currentY, maxScroll, viewportHeight) {
-    if (!indicator.host || indicator.container !== container) {
+    if (!indicator.track || indicator.container !== container) {
       return;
     }
 
@@ -464,14 +575,10 @@
       indicator.thumbHit.style.opacity = '1';
       indicator.thumbHit.style.pointerEvents = 'auto';
     }
-
-    if (!indicator.dragging) {
-      scheduleHideIndicator();
-    }
   }
 
   function destroyIndicator() {
-    clearHideTimer();
+    clearIndicatorTimers();
 
     if (indicator.host && indicator.host.parentNode) {
       indicator.host.parentNode.removeChild(indicator.host);
@@ -482,6 +589,10 @@
     indicator.thumbHit = null;
     indicator.pill = null;
     indicator.container = null;
+    indicator.lastTrackTime = 0;
+    indicator.lastTrackTransform = '';
+    indicator.lastTrackHeight = '';
+    indicator.lastThumbHeight = -1;
     indicator.visible = false;
     indicator.hovering = false;
     indicator.dragging = false;
@@ -719,22 +830,49 @@
     return state;
   }
 
-  function finishState(state) {
+  function finishState(state, {
+    forget = false,
+    resetVelocity = false
+  } = {}) {
     const container = state.container;
 
     if (state.raf) {
       cancelAnimationFrame(state.raf);
     }
 
-    if (container) {
-      states.delete(container);
-    }
-
     activeStates.delete(state);
 
     state.raf = 0;
     state.lastTime = 0;
-    state.container = null;
+
+    // Only reset velocity when an external interaction
+    // interrupts the hydraulic animation.
+    if (resetVelocity) {
+      state.inputSpeed = 0;
+      state.tauMs = TAU_MIN_MS;
+      state.lastWheelTime = 0;
+    }
+
+    // Preserve the WeakMap state after normal animation completion
+    // so adaptive damping retains its recent input history.
+    if (forget && container) {
+      states.delete(container);
+      state.container = null;
+    }
+
+    if (
+      INDICATOR_ALLOWED &&
+      container &&
+      indicator.container === container &&
+      !indicator.dragging &&
+      !indicator.hovering
+    ) {
+      if (!container.isConnected) {
+        hideIndicator();
+      } else {
+        scheduleHideIndicator();
+      }
+    }
   }
 
   // =========================================================
@@ -780,7 +918,10 @@
       !container ||
       !container.isConnected
     ) {
-      finishState(state);
+      finishState(state, {
+        forget: true,
+        resetVelocity: true
+      });
       return;
     }
 
@@ -832,12 +973,14 @@
         state.currentY
       );
 
-      renderIndicator(
-        container,
-        state.currentY,
-        maxScroll,
-        viewportHeight
-      );
+      if (INDICATOR_ALLOWED) {
+        renderIndicator(
+          container,
+          state.currentY,
+          maxScroll,
+          viewportHeight
+        );
+      }
 
       state.raf = requestAnimationFrame(
         nextTime => animate(state, nextTime)
@@ -850,19 +993,21 @@
 
       state.currentY = state.targetY;
 
-      renderIndicator(
-        container,
-        state.targetY,
-        maxScroll,
-        viewportHeight
-      );
+      if (INDICATOR_ALLOWED) {
+        renderIndicator(
+          container,
+          state.targetY,
+          maxScroll,
+          viewportHeight
+        );
+      }
 
       finishState(state);
     }
   }
 
   // =========================================================
-  // 11. WHEEL & KEYBOARD HANDLERS
+  // 11. WHEEL, KEYBOARD & RESIZE HANDLERS
   // =========================================================
 
   function onWheel(event) {
@@ -872,6 +1017,11 @@
     } = getCandidates(event);
 
     if (shouldIgnore(event, path)) {
+      return;
+    }
+
+    if (INDICATOR_ALLOWED && indicator.dragging) {
+      event.preventDefault();
       return;
     }
 
@@ -927,7 +1077,10 @@
 
     event.preventDefault();
     state.targetY = nextTarget;
-    refreshIndicatorTrack(container);
+
+    if (INDICATOR_ALLOWED) {
+      refreshIndicatorTrack(container);
+    }
 
     if (!state.raf) {
       activeStates.add(state);
@@ -952,7 +1105,42 @@
     }
 
     for (const state of [...activeStates]) {
-      finishState(state);
+      finishState(state, {
+        resetVelocity: true
+      });
+    }
+  }
+
+  function onResize() {
+    indicator.lastTrackTime = 0;
+
+    if (
+      INDICATOR_ALLOWED &&
+      indicator.container &&
+      indicator.visible
+    ) {
+      if (!indicator.container.isConnected) {
+        hideIndicator();
+        return;
+      }
+
+      refreshIndicatorTrack(indicator.container, true);
+
+      const state = states.get(indicator.container);
+      const currentY = state && state.raf
+        ? state.currentY
+        : getScrollTop(indicator.container);
+
+      renderIndicator(
+        indicator.container,
+        currentY,
+        getMaxScroll(indicator.container),
+        getViewportHeight(indicator.container)
+      );
+
+      if (!indicator.dragging && !indicator.hovering && !(state && state.raf)) {
+        scheduleHideIndicator();
+      }
     }
   }
 
@@ -969,6 +1157,12 @@
     passive: true,
     capture: true
   });
+
+  if (INDICATOR_ALLOWED) {
+    window.addEventListener('resize', onResize, {
+      passive: true
+    });
+  }
 
   // =========================================================
   // 13. CLEANUP
@@ -987,8 +1181,18 @@
       true
     );
 
+    if (INDICATOR_ALLOWED) {
+      window.removeEventListener(
+        'resize',
+        onResize
+      );
+    }
+
     for (const state of [...activeStates]) {
-      finishState(state);
+      finishState(state, {
+        forget: true,
+        resetVelocity: true
+      });
     }
 
     activeStates.clear();
@@ -1002,8 +1206,8 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.12 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.14 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
-    `GPU overlay indicator enabled.`
+    `Overlay indicator ${INDICATOR_ALLOWED ? 'enabled' : 'disabled'}.`
   );
 })();
