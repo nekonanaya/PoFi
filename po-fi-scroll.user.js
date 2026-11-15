@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.14
+// @version      1.2.15
 // @description  Adaptive exponential damping scroll with instant RAF positioning and floating overlay indicator
 // @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
@@ -178,6 +178,21 @@
     return false;
   }
 
+  function isBodyPropagatedToViewport(container) {
+    if (container !== document.body || isRoot(container)) {
+      return false;
+    }
+
+    const html = document.documentElement;
+    if (!html) {
+      return false;
+    }
+
+    const htmlStyle = getComputedStyle(html);
+    return htmlStyle.overflowX === 'visible' &&
+      htmlStyle.overflowY === 'visible';
+  }
+
   function isScrollable(container, style) {
     if (!container || !container.isConnected) {
       return false;
@@ -186,6 +201,10 @@
     if (isRoot(container)) {
       return !isRootOverflowLocked() &&
         getMaxScroll(container) > BOUNDARY_EPSILON;
+    }
+
+    if (isBodyPropagatedToViewport(container)) {
+      return false;
     }
 
     const overflowY =
@@ -765,11 +784,22 @@
 
       const maxScroll = getMaxScroll(container);
       const state = states.get(container);
+      const actualTop = getScrollTop(container);
+
+      if (
+        state &&
+        !state.raf &&
+        state.blockedDir === direction &&
+        Math.abs(actualTop - state.blockedTop) < 0.5 &&
+        Math.abs(maxScroll - state.blockedMaxScroll) < 0.5
+      ) {
+        continue;
+      }
 
       const current =
         state && state.raf
           ? state.targetY
-          : getScrollTop(container);
+          : actualTop;
 
       const canScrollDown =
         direction > 0 &&
@@ -821,7 +851,16 @@
 
         inputSpeed: 0,
         tauMs: TAU_MIN_MS,
-        lastWheelTime: 0
+        lastWheelTime: 0,
+
+        animStartTop: current,
+        animDirection: 0,
+        animMoved: false,
+        animCheckFrames: 0,
+
+        blockedDir: 0,
+        blockedTop: 0,
+        blockedMaxScroll: 0
       };
 
       states.set(container, state);
@@ -844,17 +883,16 @@
 
     state.raf = 0;
     state.lastTime = 0;
+    state.animDirection = 0;
+    state.animMoved = false;
+    state.animCheckFrames = 0;
 
-    // Only reset velocity when an external interaction
-    // interrupts the hydraulic animation.
     if (resetVelocity) {
       state.inputSpeed = 0;
       state.tauMs = TAU_MIN_MS;
       state.lastWheelTime = 0;
     }
 
-    // Preserve the WeakMap state after normal animation completion
-    // so adaptive damping retains its recent input history.
     if (forget && container) {
       states.delete(container);
       state.container = null;
@@ -973,6 +1011,28 @@
         state.currentY
       );
 
+      if (
+        !state.animMoved &&
+        state.animDirection !== 0 &&
+        Math.abs(state.currentY - state.animStartTop) >= 2
+      ) {
+        const actualTop = getScrollTop(container);
+        if ((actualTop - state.animStartTop) * state.animDirection >= 0.5) {
+          state.animMoved = true;
+        } else {
+          state.animCheckFrames += 1;
+          if (state.animCheckFrames >= 2) {
+            state.blockedDir = state.animDirection;
+            state.blockedTop = actualTop;
+            state.blockedMaxScroll = maxScroll;
+            finishState(state, {
+              resetVelocity: true
+            });
+            return;
+          }
+        }
+      }
+
       if (INDICATOR_ALLOWED) {
         renderIndicator(
           container,
@@ -992,6 +1052,19 @@
       );
 
       state.currentY = state.targetY;
+
+      if (
+        !state.animMoved &&
+        state.animDirection !== 0 &&
+        Math.abs(state.targetY - state.animStartTop) >= 1
+      ) {
+        const actualTop = getScrollTop(container);
+        if ((actualTop - state.animStartTop) * state.animDirection < 0.5) {
+          state.blockedDir = state.animDirection;
+          state.blockedTop = actualTop;
+          state.blockedMaxScroll = maxScroll;
+        }
+      }
 
       if (INDICATOR_ALLOWED) {
         renderIndicator(
@@ -1025,9 +1098,10 @@
       return;
     }
 
+    const direction = Math.sign(event.deltaY);
     const container = findScrollableContainer(
       candidates,
-      Math.sign(event.deltaY)
+      direction
     );
 
     if (!container) {
@@ -1045,12 +1119,22 @@
     }
 
     const state = getState(container);
+    state.blockedDir = 0;
 
     if (!state.raf) {
       const current = getScrollTop(container);
       state.currentY = current;
       state.targetY = current;
       state.lastTime = 0;
+      state.animStartTop = current;
+      state.animDirection = direction;
+      state.animMoved = false;
+      state.animCheckFrames = 0;
+    } else if (direction !== state.animDirection) {
+      state.animStartTop = getScrollTop(container);
+      state.animDirection = direction;
+      state.animMoved = false;
+      state.animCheckFrames = 0;
     }
 
     const maxScroll = getMaxScroll(container);
@@ -1206,7 +1290,7 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.14 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.15 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
     `Overlay indicator ${INDICATOR_ALLOWED ? 'enabled' : 'disabled'}.`
   );
