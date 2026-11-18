@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.15
+// @version      1.2.17
 // @description  Adaptive exponential damping scroll with instant RAF positioning and floating overlay indicator
 // @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
@@ -34,6 +34,7 @@
   const LINE_SIZE = 40;
   const EPSILON = 0.5;
   const BOUNDARY_EPSILON = 1.5;
+  const ANCHOR_SHIFT_TOLERANCE = 4.0;
 
   // Floating overlay indicator config.
   const INDICATOR_ENABLED = true;
@@ -210,8 +211,27 @@
     const overflowY =
       (style || getComputedStyle(container)).overflowY;
 
-    return /^(auto|scroll|overlay)$/.test(overflowY) &&
-      getMaxScroll(container) > BOUNDARY_EPSILON;
+    if (!/^(auto|scroll|overlay)$/.test(overflowY)) {
+      return false;
+    }
+
+    const maxScroll = getMaxScroll(container);
+
+    // Ignore negligible padding / font-metric vertical bleed on non-root boxes.
+    if (maxScroll <= 6) {
+      return false;
+    }
+
+    // Ignore horizontal-only boxes (e.g. single-line code blocks) whose tiny
+    // vertical overflow comes from a horizontal scrollbar or line-height bleed.
+    if (
+      container.scrollWidth > container.clientWidth + BOUNDARY_EPSILON &&
+      maxScroll <= 24
+    ) {
+      return false;
+    }
+
+    return true;
   }
 
   function clamp(value, min, max) {
@@ -831,7 +851,7 @@
   }
 
   // =========================================================
-  // 8. STATE MANAGEMENT
+  // 8. STATE MANAGEMENT & ANCHOR RECONCILIATION
   // =========================================================
 
   function getState(container) {
@@ -845,6 +865,7 @@
 
         currentY: current,
         targetY: current,
+        lastAppliedY: current,
 
         lastTime: 0,
         raf: 0,
@@ -867,6 +888,32 @@
     }
 
     return state;
+  }
+
+  function reconcileAnchorShift(state, container, maxScroll) {
+    const actualTop = getScrollTop(container);
+    const shift = actualTop - state.lastAppliedY;
+
+    if (Math.abs(shift) <= ANCHOR_SHIFT_TOLERANCE) {
+      return;
+    }
+
+    // Let the stuck-container detector handle clamped containers.
+    if (
+      !state.animMoved &&
+      state.animDirection !== 0 &&
+      (actualTop - state.animStartTop) * state.animDirection < 0.5 &&
+      Math.abs(state.lastAppliedY - state.animStartTop) >= 2
+    ) {
+      return;
+    }
+
+    // Follow browser scroll-anchoring / content-visibility shifts seamlessly
+    // without interrupting the hydraulic glide or resetting velocity.
+    state.currentY = clamp(state.currentY + shift, 0, maxScroll);
+    state.targetY = clamp(state.targetY + shift, 0, maxScroll);
+    state.animStartTop = clamp(state.animStartTop + shift, 0, maxScroll);
+    state.lastAppliedY = actualTop;
   }
 
   function finishState(state, {
@@ -977,6 +1024,8 @@
       ? Math.max(0, container.scrollHeight - viewportHeight)
       : 0;
 
+    reconcileAnchorShift(state, container, maxScroll);
+
     state.targetY = clamp(
       state.targetY,
       0,
@@ -1010,6 +1059,7 @@
         container,
         state.currentY
       );
+      state.lastAppliedY = state.currentY;
 
       if (
         !state.animMoved &&
@@ -1052,6 +1102,7 @@
       );
 
       state.currentY = state.targetY;
+      state.lastAppliedY = state.targetY;
 
       if (
         !state.animMoved &&
@@ -1080,7 +1131,7 @@
   }
 
   // =========================================================
-  // 11. WHEEL, KEYBOARD & RESIZE HANDLERS
+  // 11. WHEEL, POINTER, KEYBOARD & RESIZE HANDLERS
   // =========================================================
 
   function onWheel(event) {
@@ -1119,25 +1170,28 @@
     }
 
     const state = getState(container);
+    const maxScroll = getMaxScroll(container);
     state.blockedDir = 0;
 
     if (!state.raf) {
       const current = getScrollTop(container);
       state.currentY = current;
       state.targetY = current;
+      state.lastAppliedY = current;
       state.lastTime = 0;
       state.animStartTop = current;
       state.animDirection = direction;
       state.animMoved = false;
       state.animCheckFrames = 0;
-    } else if (direction !== state.animDirection) {
-      state.animStartTop = getScrollTop(container);
-      state.animDirection = direction;
-      state.animMoved = false;
-      state.animCheckFrames = 0;
+    } else {
+      reconcileAnchorShift(state, container, maxScroll);
+      if (direction !== state.animDirection) {
+        state.animStartTop = getScrollTop(container);
+        state.animDirection = direction;
+        state.animMoved = false;
+        state.animCheckFrames = 0;
+      }
     }
-
-    const maxScroll = getMaxScroll(container);
 
     const nextTarget = clamp(
       state.targetY + delta,
@@ -1172,6 +1226,18 @@
       state.raf = requestAnimationFrame(
         time => animate(state, time)
       );
+    }
+  }
+
+  function onPointerDown() {
+    if (!activeStates.size) {
+      return;
+    }
+
+    for (const state of [...activeStates]) {
+      finishState(state, {
+        resetVelocity: true
+      });
     }
   }
 
@@ -1237,6 +1303,11 @@
     capture: true
   });
 
+  window.addEventListener('pointerdown', onPointerDown, {
+    passive: true,
+    capture: true
+  });
+
   window.addEventListener('keydown', onKeyDown, {
     passive: true,
     capture: true
@@ -1256,6 +1327,12 @@
     window.removeEventListener(
       'wheel',
       onWheel,
+      true
+    );
+
+    window.removeEventListener(
+      'pointerdown',
+      onPointerDown,
       true
     );
 
@@ -1290,7 +1367,7 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.15 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.17 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
     `Overlay indicator ${INDICATOR_ALLOWED ? 'enabled' : 'disabled'}.`
   );
