@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.17
+// @version      1.2.21
 // @description  Adaptive exponential damping scroll with instant RAF positioning and floating overlay indicator
 // @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
@@ -34,15 +34,24 @@
   const LINE_SIZE = 40;
   const EPSILON = 0.5;
   const BOUNDARY_EPSILON = 1.5;
+  const MIN_CHILD_SCROLL_PX = 6;
+  const HORIZONTAL_BLEED_MAX_PX = 24;
   const ANCHOR_SHIFT_TOLERANCE = 4.0;
 
   // Floating overlay indicator config.
   const INDICATOR_ENABLED = true;
+
+    // Global scroll bypass list: preserves native compositor scrolling on matched hosts.
+  const SCROLL_EXCLUDED_HOSTS = [
+    'chatgpt.com',
+    'chat.openai.com'
+  ];
   // 'exclude': enabled everywhere except INDICATOR_HOSTS.
   // 'include': enabled only on INDICATOR_HOSTS.
   const INDICATOR_MODE = 'exclude';
   const INDICATOR_HOSTS = [
-    // 'example.com'
+    // 'x.com',
+    // 'twitter.com'
   ];
 
   const INDICATOR_HIDE_DELAY_MS = 900;
@@ -51,6 +60,12 @@
   const INDICATOR_PADDING_PX = 4;
   const INDICATOR_MIN_THUMB_PX = 28;
   const INSTANCE_KEY = '__POFI_HYDRAULIC_SCROLL__';
+
+  const IGNORE_STATIC_SELECTOR =
+    '.g-singlec-ct .n-single .lyric, ' +
+    '.g-singlec-ct .n-single .rnp-lyrics, ' +
+    '[data-pofi-native-scroll], ' +
+    'select, input[type="number"], input[type="range"]';
 
   const NAV_KEYS = new Set([
     'PageUp',
@@ -157,12 +172,15 @@
     );
   }
 
-  function isRootOverflowLocked() {
+  function isRootOverflowLocked(htmlStyle) {
     const html = document.documentElement;
     const body = document.body;
 
-    const htmlOverflow = html
-      ? getComputedStyle(html).overflowY
+    const resolvedHtmlStyle = htmlStyle ||
+      (html ? getComputedStyle(html) : null);
+
+    const htmlOverflow = resolvedHtmlStyle
+      ? resolvedHtmlStyle.overflowY
       : 'visible';
 
     if (htmlOverflow === 'hidden' || htmlOverflow === 'clip') {
@@ -179,59 +197,52 @@
     return false;
   }
 
-  function isBodyPropagatedToViewport(container) {
+  function isBodyPropagatedToViewport(container, htmlStyle) {
     if (container !== document.body || isRoot(container)) {
       return false;
     }
 
     const html = document.documentElement;
-    if (!html) {
+    const resolvedHtmlStyle = htmlStyle ||
+      (html ? getComputedStyle(html) : null);
+
+    if (!resolvedHtmlStyle) {
       return false;
     }
 
-    const htmlStyle = getComputedStyle(html);
-    return htmlStyle.overflowX === 'visible' &&
-      htmlStyle.overflowY === 'visible';
+    return resolvedHtmlStyle.overflowX === 'visible' &&
+      resolvedHtmlStyle.overflowY === 'visible';
   }
 
-  function isScrollable(container, style) {
+  function isHorizontalBleedBox(container, maxScroll) {
+    return maxScroll <= HORIZONTAL_BLEED_MAX_PX &&
+      container.scrollWidth > container.clientWidth + BOUNDARY_EPSILON;
+  }
+
+  function isScrollable(container, style, htmlStyle) {
     if (!container || !container.isConnected) {
       return false;
     }
 
     if (isRoot(container)) {
-      return !isRootOverflowLocked() &&
+      return !isRootOverflowLocked(htmlStyle) &&
         getMaxScroll(container) > BOUNDARY_EPSILON;
     }
 
-    if (isBodyPropagatedToViewport(container)) {
+    if (isBodyPropagatedToViewport(container, htmlStyle)) {
+      return false;
+    }
+
+    const maxScroll = getMaxScroll(container);
+
+    if (maxScroll <= MIN_CHILD_SCROLL_PX || isHorizontalBleedBox(container, maxScroll)) {
       return false;
     }
 
     const overflowY =
       (style || getComputedStyle(container)).overflowY;
 
-    if (!/^(auto|scroll|overlay)$/.test(overflowY)) {
-      return false;
-    }
-
-    const maxScroll = getMaxScroll(container);
-
-    // Ignore negligible padding / font-metric vertical bleed on non-root boxes.
-    if (maxScroll <= 6) {
-      return false;
-    }
-
-    // Ignore horizontal-only boxes (e.g. single-line code blocks) whose tiny
-    // vertical overflow comes from a horizontal scrollbar or line-height bleed.
-    if (
-      container.scrollWidth > container.clientWidth + BOUNDARY_EPSILON &&
-      maxScroll <= 24
-    ) {
-      return false;
-    }
-
-    return true;
+    return /^(auto|scroll|overlay)$/.test(overflowY);
   }
 
   function clamp(value, min, max) {
@@ -641,42 +652,36 @@
   // 5. INPUT FILTERING
   // =========================================================
 
-  function shouldIgnore(event, path) {
-    if (
-      event.defaultPrevented ||
+  function isIgnoredWheelEvent(event) {
+    return event.defaultPrevented ||
       !event.cancelable ||
       event.ctrlKey ||
       event.shiftKey ||
       event.altKey ||
       event.metaKey ||
       event.deltaY === 0 ||
-      Math.abs(event.deltaX) > Math.abs(event.deltaY)
-    ) {
-      return true;
-    }
+      Math.abs(event.deltaX) > Math.abs(event.deltaY);
+  }
 
+  function getEventPath(event) {
+    return event.composedPath
+      ? event.composedPath()
+      : [event.target];
+  }
+
+  function hasIgnoredAncestor(path) {
     for (const node of path) {
       if (!(node instanceof Element)) continue;
 
-      if (
-        // Preserve native NCM playback lyric scrolling.
-        node.matches(
-          '.g-singlec-ct .n-single .lyric, ' +
-          '.g-singlec-ct .n-single .rnp-lyrics'
-        ) ||
-
-        node.hasAttribute('data-pofi-native-scroll') ||
-
-        node.matches(
-          'select, input[type="number"], input[type="range"]'
-        )
-      ) {
+      if (node.matches(IGNORE_STATIC_SELECTOR)) {
         return true;
       }
 
       if (
-        (node.matches('textarea, [role="textbox"]') || node.isContentEditable) &&
-        node.scrollHeight > node.clientHeight + BOUNDARY_EPSILON
+        (node.isContentEditable ||
+          node.tagName === 'TEXTAREA' ||
+          node.getAttribute('role') === 'textbox') &&
+        node.scrollHeight > node.clientHeight + MIN_CHILD_SCROLL_PX
       ) {
         return true;
       }
@@ -685,11 +690,7 @@
     return false;
   }
 
-  function getCandidates(event) {
-    const path = event.composedPath
-      ? event.composedPath()
-      : [event.target];
-
+  function getCandidates(path) {
     const candidates = [];
     const seen = new Set();
 
@@ -698,10 +699,7 @@
 
       const container = normalizeContainer(node);
 
-      if (
-        container &&
-        !seen.has(container)
-      ) {
+      if (container && !seen.has(container)) {
         seen.add(container);
         candidates.push(container);
       }
@@ -713,10 +711,7 @@
       candidates.push(root);
     }
 
-    return {
-      path,
-      candidates
-    };
+    return candidates;
   }
 
   function getDelta(event, container) {
@@ -796,23 +791,66 @@
   // 7. SCROLL CONTAINER SELECTION
   // =========================================================
 
+  function isContainerBlocked(container, state, direction, actualTop, maxScroll) {
+    return !isRoot(container) &&
+      Boolean(state) &&
+      !state.raf &&
+      state.blockedDir === direction &&
+      Math.abs(actualTop - state.blockedTop) < 0.5 &&
+      Math.abs(maxScroll - state.blockedMaxScroll) < 0.5;
+  }
+
   function findScrollableContainer(candidates, direction) {
+    let htmlStyle = null;
+    const getHtmlStyle = () => {
+      if (!htmlStyle && document.documentElement) {
+        htmlStyle = getComputedStyle(document.documentElement);
+      }
+      return htmlStyle;
+    };
+
     for (const container of candidates) {
-      const style = getComputedStyle(container);
+      if (!container || !container.isConnected) continue;
 
-      if (!isScrollable(container, style)) continue;
+      const rootContainer = isRoot(container);
+      let maxScroll = 0;
+      let style = null;
 
-      const maxScroll = getMaxScroll(container);
+      if (rootContainer) {
+        const hs = getHtmlStyle();
+        if (isRootOverflowLocked(hs)) continue;
+
+        maxScroll = getMaxScroll(container);
+        if (maxScroll <= BOUNDARY_EPSILON) continue;
+
+        style = container === document.documentElement && hs
+          ? hs
+          : getComputedStyle(container);
+      } else {
+        const clientHeight = container.clientHeight;
+        if (clientHeight <= 0) continue;
+
+        maxScroll = container.scrollHeight - clientHeight;
+        if (maxScroll <= MIN_CHILD_SCROLL_PX) continue;
+
+        if (isHorizontalBleedBox(container, maxScroll)) {
+          continue;
+        }
+
+        if (isBodyPropagatedToViewport(container, getHtmlStyle())) {
+          continue;
+        }
+
+        style = getComputedStyle(container);
+        if (!/^(auto|scroll|overlay)$/.test(style.overflowY)) {
+          continue;
+        }
+      }
+
       const state = states.get(container);
       const actualTop = getScrollTop(container);
 
-      if (
-        state &&
-        !state.raf &&
-        state.blockedDir === direction &&
-        Math.abs(actualTop - state.blockedTop) < 0.5 &&
-        Math.abs(maxScroll - state.blockedMaxScroll) < 0.5
-      ) {
+      if (isContainerBlocked(container, state, direction, actualTop, maxScroll)) {
         continue;
       }
 
@@ -851,7 +889,7 @@
   }
 
   // =========================================================
-  // 8. STATE MANAGEMENT & ANCHOR RECONCILIATION
+  // 8. STATE MANAGEMENT & ANCHOR GUARD
   // =========================================================
 
   function getState(container) {
@@ -898,8 +936,9 @@
       return;
     }
 
-    // Let the stuck-container detector handle clamped containers.
+    // Let the stuck-container detector handle clamped non-root containers.
     if (
+      !isRoot(container) &&
       !state.animMoved &&
       state.animDirection !== 0 &&
       (actualTop - state.animStartTop) * state.animDirection < 0.5 &&
@@ -908,12 +947,44 @@
       return;
     }
 
-    // Follow browser scroll-anchoring / content-visibility shifts seamlessly
-    // without interrupting the hydraulic glide or resetting velocity.
+    // Follow any browser scroll-anchoring / content-visibility shift seamlessly
+    // without blind-spot pullbacks or resetting velocity.
     state.currentY = clamp(state.currentY + shift, 0, maxScroll);
     state.targetY = clamp(state.targetY + shift, 0, maxScroll);
     state.animStartTop = clamp(state.animStartTop + shift, 0, maxScroll);
     state.lastAppliedY = actualTop;
+  }
+
+  function probeStuckContainer(state, container, maxScroll) {
+    if (
+      isRoot(container) ||
+      state.animMoved ||
+      state.animDirection === 0 ||
+      Math.abs(state.currentY - state.animStartTop) < 2
+    ) {
+      return false;
+    }
+
+    const actualTop = getScrollTop(container);
+
+    if ((actualTop - state.animStartTop) * state.animDirection >= 0.5) {
+      state.animMoved = true;
+      return false;
+    }
+
+    state.animCheckFrames += 1;
+
+    if (state.animCheckFrames >= 2) {
+      state.blockedDir = state.animDirection;
+      state.blockedTop = actualTop;
+      state.blockedMaxScroll = maxScroll;
+      finishState(state, {
+        resetVelocity: true
+      });
+      return true;
+    }
+
+    return false;
   }
 
   function finishState(state, {
@@ -1061,26 +1132,8 @@
       );
       state.lastAppliedY = state.currentY;
 
-      if (
-        !state.animMoved &&
-        state.animDirection !== 0 &&
-        Math.abs(state.currentY - state.animStartTop) >= 2
-      ) {
-        const actualTop = getScrollTop(container);
-        if ((actualTop - state.animStartTop) * state.animDirection >= 0.5) {
-          state.animMoved = true;
-        } else {
-          state.animCheckFrames += 1;
-          if (state.animCheckFrames >= 2) {
-            state.blockedDir = state.animDirection;
-            state.blockedTop = actualTop;
-            state.blockedMaxScroll = maxScroll;
-            finishState(state, {
-              resetVelocity: true
-            });
-            return;
-          }
-        }
+      if (probeStuckContainer(state, container, maxScroll)) {
+        return;
       }
 
       if (INDICATOR_ALLOWED) {
@@ -1105,6 +1158,7 @@
       state.lastAppliedY = state.targetY;
 
       if (
+        !isRoot(container) &&
         !state.animMoved &&
         state.animDirection !== 0 &&
         Math.abs(state.targetY - state.animStartTop) >= 1
@@ -1135,12 +1189,7 @@
   // =========================================================
 
   function onWheel(event) {
-    const {
-      path,
-      candidates
-    } = getCandidates(event);
-
-    if (shouldIgnore(event, path)) {
+    if (isIgnoredWheelEvent(event)) {
       return;
     }
 
@@ -1149,6 +1198,13 @@
       return;
     }
 
+    const path = getEventPath(event);
+
+    if (hasIgnoredAncestor(path)) {
+      return;
+    }
+
+    const candidates = getCandidates(path);
     const direction = Math.sign(event.deltaY);
     const container = findScrollableContainer(
       candidates,
@@ -1367,7 +1423,7 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.17 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.21 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
     `Overlay indicator ${INDICATOR_ALLOWED ? 'enabled' : 'disabled'}.`
   );
