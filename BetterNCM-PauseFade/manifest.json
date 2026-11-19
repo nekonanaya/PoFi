@@ -1,0 +1,17 @@
+{
+  "manifest_version": 1,
+  "name": "WASAPI Pause Fade",
+  "slug": "pause-fade",
+  "version": "0.5.2",
+  "betterncm_version": ">=1.0.0",
+  "author": "SisterMeow",
+  "description": "暂停/恢复平滑淡出淡入（支持对数听感曲线与IPC自动嗅探）",
+  "ncm3-compatible": true,
+  "injects": {
+    "Main": [
+      {
+        "file": "main.js"
+      }
+    ]
+  }
+}
