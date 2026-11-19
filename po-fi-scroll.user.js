@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Po-Fi Hydraulic Scroll
 // @namespace    https://github.com/nekonanaya/PoFi
-// @version      1.2.23
+// @version      1.2.24
 // @description  Adaptive exponential damping scroll with instant RAF positioning and floating overlay indicator
 // @author       Nyanyaya & 姐姐喵 & GPT龙娘
 // @match        *://*/*
@@ -18,17 +18,13 @@
   // 1. CONFIGURATION
   // =========================================================
 
-   const WHEEL_GAIN = 1.00;
-  const KINETIC_BOOST_MAX = 1.22; // 温和的快刷惯性余量，灵动不窜
+  const WHEEL_GAIN = 1.00;
+  const KINETIC_BOOST_MAX = 1.22;
 
-  // 慢速 62ms(浓稠黄油)，快速降至 46ms(轻盈且保留优雅尾段滑行)
   const TAU_MIN_MS = 46;
   const TAU_MAX_MS = 62;
 
-  // Input velocity reference (CSS pixels per millisecond).
   const SPEED_REFERENCE_PX_PER_MS = 4.5;
-
-  // Velocity filtering and idle reset.
   const SPEED_FILTER_MS = 85;
   const SPEED_RESET_MS = 180;
 
@@ -40,22 +36,17 @@
   const CODE_BLOCK_BLEED_MAX_PX = 36;
   const ANCHOR_SHIFT_TOLERANCE = 4.0;
 
-  // Floating overlay indicator config.
   const INDICATOR_ENABLED = true;
 
-  // Global scroll bypass list: preserves native compositor scrolling on matched hosts.
-  // (想对比测试 ChatGPT 上的优化效果时，临时注释掉下面两行即可)
   const SCROLL_EXCLUDED_HOSTS = [
     'chatgpt.com',
     'chat.openai.com'
   ];
 
-  // 'exclude': enabled everywhere except INDICATOR_HOSTS.
-  // 'include': enabled only on INDICATOR_HOSTS.
   const INDICATOR_MODE = 'exclude';
   const INDICATOR_HOSTS = [
-    // 'x.com',
-    // 'twitter.com'
+    'x.com',
+    'twitter.com'
   ];
 
   const INDICATOR_HIDE_DELAY_MS = 900;
@@ -253,8 +244,7 @@
       Math.min(value, max)
     );
   }
-
-  // =========================================================
+      // =========================================================
   // 4. FLOATING OVERLAY SCROLLBAR (SHADOW DOM)
   // =========================================================
 
@@ -649,8 +639,7 @@
     indicator.hovering = false;
     indicator.dragging = false;
   }
-
-  // =========================================================
+      // =========================================================
   // 5. INPUT FILTERING
   // =========================================================
 
@@ -716,15 +705,9 @@
     return candidates;
   }
 
-  function getDelta(event, container) {
-    if (event.deltaMode === 1) {
-      return event.deltaY * LINE_SIZE;
-    }
-
-    if (event.deltaMode === 2) {
-      return event.deltaY * getViewportHeight(container);
-    }
-
+  function getDelta(event, viewportHeight) {
+    if (event.deltaMode === 1) return event.deltaY * LINE_SIZE;
+    if (event.deltaMode === 2) return event.deltaY * viewportHeight;
     return event.deltaY;
   }
 
@@ -732,34 +715,30 @@
   // 6. ADAPTIVE HYDRAULIC DAMPING
   // =========================================================
 
-  function getAdaptiveTau(inputSpeed) {
-    const normalized = clamp(
-      inputSpeed / SPEED_REFERENCE_PX_PER_MS,
-      0,
-      1
-    );
-
-    const curve =
-      normalized * normalized *
-      (3 - 2 * normalized);
-
-    // 慢速高阻尼如黄油(TAU_MAX_MS)，快速泄压变丝滑(TAU_MIN_MS)
-    return TAU_MAX_MS -
-      (TAU_MAX_MS - TAU_MIN_MS) * curve;
+  // Pure helpers: input speed maps continuously to one coherent motion profile.
+  function smoothstep01(value) {
+    const t = clamp(value, 0, 1);
+    return t * t * (3 - 2 * t);
   }
 
-  function getAdaptiveGain(inputSpeed) {
-    const normalized = clamp(
+  function getMotionProfile(inputSpeed) {
+    const speed = clamp(
       inputSpeed / SPEED_REFERENCE_PX_PER_MS,
       0,
       1
     );
+    const curve = smoothstep01(speed);
 
-    const curve =
-      normalized * normalized *
-      (3 - 2 * normalized);
+    return {
+      tauMs: TAU_MAX_MS - (TAU_MAX_MS - TAU_MIN_MS) * curve,
+      wheelGain: WHEEL_GAIN * (1 + (KINETIC_BOOST_MAX - 1) * curve)
+    };
+  }
 
-    return WHEEL_GAIN * (1 + (KINETIC_BOOST_MAX - 1) * curve);
+  // Exact first-order response over elapsed time; no frame-rate-specific easing.
+  function dampToward(current, target, elapsedMs, tauMs) {
+    const blend = 1 - Math.exp(-elapsedMs / tauMs);
+    return current + (target - current) * blend;
   }
 
   function updateAdaptiveDamping(state, delta, now) {
@@ -769,7 +748,7 @@
 
     if (elapsed > SPEED_RESET_MS) {
       state.inputSpeed = 0;
-      elapsed = 80; // 冷启动第一格按从容慢滑基准算，防止误判成高速甩屏
+      elapsed = 80;
     }
 
     const sampleDt = clamp(
@@ -797,19 +776,9 @@
         state.inputSpeed
       ) * alpha;
 
-    const normalized = clamp(
-      state.inputSpeed / SPEED_REFERENCE_PX_PER_MS,
-      0,
-      1
-    );
-
-    state.speedCurve =
-      normalized * normalized *
-      (3 - 2 * normalized);
-
-    state.tauMs = getAdaptiveTau(
-      state.inputSpeed
-    );
+    const profile = getMotionProfile(state.inputSpeed);
+    state.tauMs = profile.tauMs;
+    state.wheelGain = profile.wheelGain;
 
     state.lastWheelTime = now;
   }
@@ -840,94 +809,72 @@
       if (!container || !container.isConnected) continue;
 
       const rootContainer = isRoot(container);
+      let viewportHeight = 0;
       let maxScroll = 0;
-      let style = null;
+      let style;
 
       if (rootContainer) {
         const hs = getHtmlStyle();
         if (isRootOverflowLocked(hs)) continue;
 
-        maxScroll = getMaxScroll(container);
+        viewportHeight = getViewportHeight(container);
+        if (viewportHeight <= 0) continue;
+
+        maxScroll = Math.max(0, container.scrollHeight - viewportHeight);
         if (maxScroll <= BOUNDARY_EPSILON) continue;
 
         style = container === document.documentElement && hs
           ? hs
           : getComputedStyle(container);
       } else {
-        const clientHeight = container.clientHeight;
-        if (clientHeight <= 0) continue;
+        viewportHeight = getViewportHeight(container);
+        if (viewportHeight <= 0) continue;
 
-        maxScroll = container.scrollHeight - clientHeight;
+        maxScroll = Math.max(0, container.scrollHeight - viewportHeight);
         if (maxScroll <= MIN_CHILD_SCROLL_PX) continue;
-
-        if (isHorizontalBleedBox(container, maxScroll)) {
-          continue;
-        }
-
-        if (isCodeBlockBleedBox(container, maxScroll)) {
-          continue;
-        }
-
-        if (isBodyPropagatedToViewport(container, getHtmlStyle())) {
-          continue;
-        }
+        if (isHorizontalBleedBox(container, maxScroll)) continue;
+        if (isCodeBlockBleedBox(container, maxScroll)) continue;
+        if (isBodyPropagatedToViewport(container, getHtmlStyle())) continue;
 
         style = getComputedStyle(container);
-        if (!/^(auto|scroll|overlay)$/.test(style.overflowY)) {
-          continue;
-        }
+        if (!/^(auto|scroll|overlay)$/.test(style.overflowY)) continue;
       }
 
-      const state = states.get(container);
       const actualTop = getScrollTop(container);
+      const state = states.get(container);
 
       if (isContainerBlocked(container, state, direction, actualTop, maxScroll)) {
         continue;
       }
 
-      const current =
-        state && state.raf
-          ? state.targetY
-          : actualTop;
+      const currentTop = state && state.raf ? state.targetY : actualTop;
+      const canScroll = direction > 0
+        ? maxScroll - currentTop > BOUNDARY_EPSILON
+        : currentTop > BOUNDARY_EPSILON;
 
-      const canScrollDown =
-        direction > 0 &&
-        maxScroll - current > BOUNDARY_EPSILON;
+      if (canScroll) {
+        if (style.scrollSnapType !== 'none') return null;
 
-      const canScrollUp =
-        direction < 0 &&
-        current > BOUNDARY_EPSILON;
-
-      if (canScrollDown || canScrollUp) {
-        if (style.scrollSnapType !== 'none') {
-          return null;
-        }
-
-        return container;
+        // Carry the measurements forward: onWheel must not measure this node again.
+        return { container, viewportHeight, maxScroll, actualTop };
       }
 
-      const overscroll = style.overscrollBehaviorY;
-
-      if (
-        overscroll === 'contain' ||
-        overscroll === 'none'
-      ) {
+      if (style.overscrollBehaviorY === 'contain' || style.overscrollBehaviorY === 'none') {
         return null;
       }
     }
 
     return null;
   }
-
-  // =========================================================
+      // =========================================================
   // 8. STATE MANAGEMENT & ANCHOR GUARD
   // =========================================================
 
-  function getState(container) {
+  function getState(container, initialTop = getScrollTop(container)) {
     let state = states.get(container);
 
     if (!state) {
-      const current = getScrollTop(container);
+      const current = initialTop;
 
       state = {
         container,
@@ -940,9 +887,10 @@
         raf: 0,
 
         inputSpeed: 0,
-        speedCurve: 0,
         tauMs: TAU_MAX_MS,
+        wheelGain: WHEEL_GAIN,
         lastWheelTime: 0,
+        lastWheelDirection: 0,
 
         animStartTop: current,
         animDirection: 0,
@@ -978,7 +926,7 @@
       return;
     }
 
-    // Follow any browser scroll-anchoring / content-visibility shift seamlessly
+    // Follow any browser scroll-anchoring / content-visibility shift
     // without blind-spot pullbacks or resetting velocity.
     state.currentY = clamp(state.currentY + shift, 0, maxScroll);
     state.targetY = clamp(state.targetY + shift, 0, maxScroll);
@@ -1016,6 +964,14 @@
     return false;
   }
 
+  function resetKinetics(state) {
+    state.inputSpeed = 0;
+    state.tauMs = TAU_MAX_MS;
+    state.wheelGain = WHEEL_GAIN;
+    state.lastWheelTime = 0;
+    state.lastWheelDirection = 0;
+  }
+
   function finishState(state, {
     forget = false,
     resetVelocity = false
@@ -1034,12 +990,7 @@
     state.animMoved = false;
     state.animCheckFrames = 0;
 
-    if (resetVelocity) {
-      state.inputSpeed = 0;
-      state.speedCurve = 0;
-      state.tauMs = TAU_MAX_MS;
-      state.lastWheelTime = 0;
-    }
+    if (resetVelocity) resetKinetics(state);
 
     if (forget && container) {
       states.delete(container);
@@ -1137,13 +1088,8 @@
       maxScroll
     );
 
-    const alpha =
-      1 - Math.exp(
-        -dt / state.tauMs
-      );
-
     state.currentY = clamp(
-      state.currentY + (state.targetY - state.currentY) * alpha,
+      dampToward(state.currentY, state.targetY, dt, state.tauMs),
       0,
       maxScroll
     );
@@ -1207,15 +1153,12 @@
       finishState(state);
     }
   }
-
-  // =========================================================
+      // =========================================================
   // 11. WHEEL, POINTER, KEYBOARD & RESIZE HANDLERS
   // =========================================================
 
   function onWheel(event) {
-    if (isIgnoredWheelEvent(event)) {
-      return;
-    }
+    if (isIgnoredWheelEvent(event)) return;
 
     if (INDICATOR_ALLOWED && indicator.dragging) {
       event.preventDefault();
@@ -1223,35 +1166,24 @@
     }
 
     const path = getEventPath(event);
+    if (hasIgnoredAncestor(path)) return;
 
-    if (hasIgnoredAncestor(path)) {
-      return;
-    }
-
-    const candidates = getCandidates(path);
     const direction = Math.sign(event.deltaY);
-    const container = findScrollableContainer(
-      candidates,
-      direction
-    );
+    const selection = findScrollableContainer(getCandidates(path), direction);
+    if (!selection) return;
 
-    if (!container) {
-      return;
-    }
+    const { container, viewportHeight, maxScroll, actualTop } = selection;
+    const rawDelta = getDelta(event, viewportHeight);
+    if (!Number.isFinite(rawDelta) || rawDelta === 0) return;
 
-    const rawDelta = getDelta(event, container);
-
-    if (
-      !Number.isFinite(rawDelta) ||
-      rawDelta === 0
-    ) {
-      return;
-    }
-
-    const state = getState(container);
-    const maxScroll = getMaxScroll(container);
-    const actualTop = getScrollTop(container);
+    const state = getState(container, actualTop);
     state.blockedDir = 0;
+
+    // A reversal is a new gesture, even if the previous RAF already finished.
+    if (state.lastWheelDirection !== 0 && state.lastWheelDirection !== direction) {
+      resetKinetics(state);
+    }
+    state.lastWheelDirection = direction;
 
     if (!state.raf) {
       state.currentY = actualTop;
@@ -1265,21 +1197,19 @@
     } else {
       reconcileAnchorShift(state, container, maxScroll, actualTop);
       if (direction !== state.animDirection) {
-        // 反向拨轮立即丢弃旧方向的未完成残余队列，0延迟转身
-        state.targetY = state.currentY;
-        state.animStartTop = actualTop;
-        state.animDirection = direction;
-        state.animMoved = false;
-        state.animCheckFrames = 0;
-        state.lastAppliedY = actualTop;
-        state.inputSpeed = 0;
-        state.speedCurve = 0;
-      }
+  // Discard the unfinished target from the previous direction.
+  state.targetY = state.currentY;
+  state.animStartTop = actualTop;
+  state.animDirection = direction;
+  state.animMoved = false;
+  state.animCheckFrames = 0;
+  state.lastAppliedY = actualTop;
+}
     }
 
-    const canMove =
-      (direction > 0 && maxScroll - state.targetY > 0.01) ||
-      (direction < 0 && state.targetY > 0.01);
+    const canMove = direction > 0
+      ? maxScroll - state.targetY > 0.01
+      : state.targetY > 0.01;
 
     if (!canMove) {
       if (state.raf && Math.abs(state.targetY - state.currentY) <= EPSILON) {
@@ -1288,15 +1218,10 @@
       return;
     }
 
-    updateAdaptiveDamping(
-      state,
-      rawDelta,
-      performance.now()
-    );
+    updateAdaptiveDamping(state, rawDelta, performance.now());
 
-    const delta = rawDelta * getAdaptiveGain(state.inputSpeed);
     const nextTarget = clamp(
-      state.targetY + delta,
+      state.targetY + rawDelta * state.wheelGain,
       0,
       maxScroll
     );
@@ -1304,16 +1229,11 @@
     event.preventDefault();
     state.targetY = nextTarget;
 
-    if (INDICATOR_ALLOWED) {
-      refreshIndicatorTrack(container);
-    }
+    if (INDICATOR_ALLOWED) refreshIndicatorTrack(container);
 
     if (!state.raf) {
       activeStates.add(state);
-
-      state.raf = requestAnimationFrame(
-        time => animate(state, time)
-      );
+      state.raf = requestAnimationFrame(time => animate(state, time));
     }
   }
 
@@ -1455,7 +1375,7 @@
   window[INSTANCE_KEY] = cleanup;
 
   console.log(
-    `[Po-Fi] Hydraulic Scroll 1.2.22 active. ` +
+    `[Po-Fi] Hydraulic Scroll 1.2.24 active. ` +
     `Adaptive τ=${TAU_MIN_MS}-${TAU_MAX_MS}ms. ` +
     `Overlay indicator ${INDICATOR_ALLOWED ? 'enabled' : 'disabled'}.`
   );
