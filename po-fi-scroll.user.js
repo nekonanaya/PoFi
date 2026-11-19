@@ -45,8 +45,8 @@
 
   const INDICATOR_MODE = 'exclude';
   const INDICATOR_HOSTS = [
-    'x.com',
-    'twitter.com'
+    //'x.com',
+    //'twitter.com'
   ];
 
   const INDICATOR_HIDE_DELAY_MS = 900;
