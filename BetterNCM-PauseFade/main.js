@@ -7,7 +7,7 @@
     }
 
     // ================== 默认配置与持久化 ==================
-    const PLUGIN_VERSION = "0.5.2";
+    const PLUGIN_VERSION = "0.5.5";
     const CONFIG_STORAGE_KEY = "ncm_pause_fade_config_v1";
     const STATE_STORAGE_KEY = "ncm_pause_fade_state_v2";
     const USER_VOLUME_GESTURE_WINDOW_MS = 1200;
@@ -59,7 +59,6 @@
     const log = (...args) => CONFIG.debug && console.log(`[PauseFade v${PLUGIN_VERSION}]`, ...args);
 
     // ================== 曲线数学引擎 ==================
-    // 标准 1D 三次贝塞尔求解（Newton-Raphson + 二分法保底）
     function evalCubicBezier(x1, y1, x2, y2, t) {
         if (t <= 0) return 0;
         if (t >= 1) return 1;
@@ -104,8 +103,6 @@
     function computeCurveProgress(t, isFadeOut) {
         switch (CONFIG.curveMode) {
             case "bezier":
-                // 淡出：缓离满音 -> 对数下潜 -> 长柔尾音归零
-                // 淡入：精确镜像（零斜率浮现 -> 柔缓落定）
                 return isFadeOut
                     ? evalCubicBezier(0.30, 0.05, 0.25, 1.00, t)
                     : evalCubicBezier(0.75, 0.00, 0.70, 0.95, t);
@@ -125,7 +122,7 @@
     // fadeState: 'idle' | 'fadingOut' | 'paused' | 'fadingIn'
     let fadeState = "idle";
     let userTargetVolume = null;
-    let actualAnimatedVolume = null; // null 表示尚未观测/提交真实播放器音量
+    let actualAnimatedVolume = null;
     let pendingAction = null;        // { type: "pause", args: any[] } | null
     let fadeToken = 0;
 
@@ -135,10 +132,16 @@
 
     let rawChannelCall = null;
     let rawRegisterCall = null;
+    let instanceDisposed = false;
     let bootTimer = 0;
     let bootRestoreTimer = 0;
+    let bootRetryTimer = 0;
+    let bootProtectTimer = 0;
+    const bootReapplyTimers = new Set();
     let bootRestoreData = null;
     let bootRestorePending = false;
+    let bootProtectActive = false;
+    let bootAutoReapplyCount = 0;
     let bootUserInteracted = false;
     let lastUserVolumeGestureAt = -Infinity;
 
@@ -191,9 +194,24 @@
         return out;
     }
 
+    function isPlayerVolumeCmd(cmd) {
+        return /^(audio)?player\..*volume/i.test(cmd);
+    }
+
     function inspectVolumeCall(cmd, fullArgs) {
-        if (!/volume/i.test(cmd) || /get|mute|device|eq|info|list/i.test(cmd)) {
+        if (!/volume/i.test(cmd) || /get|mute|device|eq|info|list|normaliz|balance|gain|effect|fade|max|min|step/i.test(cmd)) {
             return null;
+        }
+
+        const prevSig = ipcProfile.volSignature;
+        const currIsPlayer = isPlayerVolumeCmd(cmd);
+
+        // 一旦锁定主播放器音量命令，禁止其他杂项 volume 命令串台覆写
+        if (prevSig && prevSig.cmd !== cmd) {
+            const prevIsPlayer = isPlayerVolumeCmd(prevSig.cmd);
+            if (prevIsPlayer || !currIsPlayer) {
+                return null;
+            }
         }
 
         let foundArgIdx = -1;
@@ -224,11 +242,9 @@
 
         if (foundArgIdx === -1) return null;
 
-        const prevSig = ipcProfile.volSignature;
         let scale = prevSig ? prevSig.scale : 1;
         let scaleLocked = prevSig ? prevSig.scaleLocked : false;
 
-        // PATCH 5：一旦锁定标度就不再被后续数值覆盖
         if (!scaleLocked) {
             if (rawVal > 1) {
                 scale = 100;
@@ -252,9 +268,8 @@
         };
     }
 
-    // PATCH 3：成功提交后再更新 actualAnimatedVolume
     function callNativeVolume(val) {
-        if (!rawChannelCall || !ipcProfile.volSignature) return false;
+        if (instanceDisposed || !rawChannelCall || !ipcProfile.volSignature) return false;
         const sig = ipcProfile.volSignature;
         const clamped = Math.max(0, Math.min(sig.scale, val));
         try {
@@ -268,7 +283,6 @@
         }
     }
 
-    // PATCH 1：零音量或零时长直通时也同步更新状态机
     function forwardPlaybackCommand(type, context, args) {
         const ret = rawChannelCall.apply(context, args);
         pendingAction = null;
@@ -325,31 +339,57 @@
         return performance.now() - lastUserVolumeGestureAt <= USER_VOLUME_GESTURE_WINDOW_MS;
     }
 
+    function clearBootTimers() {
+        clearTimeout(bootRestoreTimer);
+        clearTimeout(bootRetryTimer);
+        clearTimeout(bootProtectTimer);
+        bootRestoreTimer = 0;
+        bootRetryTimer = 0;
+        bootProtectTimer = 0;
+
+        bootReapplyTimers.forEach((id) => clearTimeout(id));
+        bootReapplyTimers.clear();
+    }
+
+    function commitBootRestore(targetVol) {
+        bootRestorePending = false;
+        bootProtectActive = false;
+        clearBootTimers();
+        userTargetVolume = targetVol;
+        if (ipcProfile.volSignature) {
+            saveVolumeState(targetVol, ipcProfile.volSignature, false);
+        }
+        refreshPanelStatus();
+    }
+
     function markBootInteracted() {
         bootUserInteracted = true;
         bootRestorePending = false;
-        if (bootRestoreTimer) {
-            clearTimeout(bootRestoreTimer);
-            bootRestoreTimer = 0;
-        }
+        bootProtectActive = false;
+        clearBootTimers();
     }
 
     function flushBootRestoreBeforePlaybackCommand() {
         if (!bootRestorePending || !bootRestoreData) return true;
 
-        if (bootRestoreTimer) {
-            clearTimeout(bootRestoreTimer);
-            bootRestoreTimer = 0;
+        if (fadeState === "fadingIn") {
+            clearBootTimers();
+            bootRestorePending = false;
+            bootProtectActive = false;
+            return true;
         }
+
+        clearBootTimers();
+
         if (bootUserInteracted) {
             bootRestorePending = false;
+            bootProtectActive = false;
             return true;
         }
 
         const ok = callNativeVolume(bootRestoreData.vol);
         if (ok) {
-            bootRestorePending = false;
-            saveVolumeState(bootRestoreData.vol, ipcProfile.volSignature, false);
+            commitBootRestore(bootRestoreData.vol);
         }
         return ok;
     }
@@ -373,34 +413,59 @@
 
             if (!ipcProfile.volSignature) {
                 ipcProfile.volSignature = data.sig;
-                refreshPanelStatus();
             }
 
             userTargetVolume = data.vol;
-            actualAnimatedVolume = null; // 真实播放器音量尚未确认
+            actualAnimatedVolume = null;
+            refreshPanelStatus();
 
-            // 显式要求 dirtyMuted === true，兼容不含该字段的旧版 v2 存档
             const dirtyMuted = data.dirtyMuted === true;
-            if (!dirtyMuted) {
+            if (!dirtyMuted || data.vol <= 0) {
                 bootRestorePending = false;
+                bootProtectActive = false;
                 return;
             }
 
             bootRestoreData = data;
             bootRestorePending = true;
+            bootProtectActive = true;
+            bootAutoReapplyCount = 0;
             bootUserInteracted = false;
+
+            const tryRestore = (label) => {
+                if (instanceDisposed || !bootRestorePending || bootUserInteracted || fadeState !== "idle" || !rawChannelCall) {
+                    return false;
+                }
+                log(`冷启动音量恢复尝试 (${label}):`, data.vol);
+                return callNativeVolume(data.vol);
+            };
 
             bootRestoreTimer = setTimeout(() => {
                 bootRestoreTimer = 0;
-                if (!bootRestorePending || bootUserInteracted || fadeState !== "idle" || !rawChannelCall) {
-                    return;
-                }
-                log("检测到上次会话在淡出/暂停静音态退出，恢复目标音量:", data.vol);
-                if (callNativeVolume(data.vol)) {
-                    bootRestorePending = false;
-                    saveVolumeState(data.vol, ipcProfile.volSignature, false);
-                }
+                tryRestore("1.5s");
             }, 1500);
+
+            bootRetryTimer = setTimeout(() => {
+                bootRetryTimer = 0;
+                tryRestore("3.5s");
+            }, 3500);
+
+            bootProtectTimer = setTimeout(() => {
+                bootProtectTimer = 0;
+                if (instanceDisposed) return;
+
+                if (bootRestorePending && !bootUserInteracted && fadeState === "idle") {
+                    const ok = tryRestore("8s-final");
+                    bootProtectActive = false;
+                    if (ok) {
+                        commitBootRestore(data.vol);
+                    } else {
+                        log("8s 最终恢复提交失败，保留待播放恢复标记");
+                    }
+                } else {
+                    bootProtectActive = false;
+                }
+            }, 8000);
         } catch (e) {
             log("启动音量恢复失败:", e);
         }
@@ -595,7 +660,19 @@
         }
     }
 
-    // ================== BetterNCM 设置面板 UI ==================
+    // ================== BetterNCM 设置面板 UI（含毛玻璃下拉选框） ==================
+    function isThemeTextLight(el) {
+        try {
+            const color = getComputedStyle(el).color || "";
+            const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+            if (!m) return true;
+            const lum = 0.299 * Number(m[1]) + 0.587 * Number(m[2]) + 0.114 * Number(m[3]);
+            return lum >= 140;
+        } catch (_) {
+            return true;
+        }
+    }
+
     function createConfigPanel() {
         const root = document.createElement("div");
         root.style.cssText = [
@@ -638,16 +715,6 @@
             "color: inherit;",
             "text-align: right;",
             "font-size: 12px;"
-        ].join("");
-
-        const selectStyle = [
-            "padding: 4px 8px;",
-            "border-radius: 6px;",
-            "border: 1px solid rgba(128, 128, 128, 0.32);",
-            "background: rgba(128, 128, 128, 0.14);",
-            "color: inherit;",
-            "font-size: 12px;",
-            "cursor: pointer;"
         ].join("");
 
         const headCard = document.createElement("div");
@@ -804,7 +871,14 @@
             hint: "通常可以比淡出略长一些，柔和拉起声音不吓耳朵"
         }).box);
 
-        // 曲线类型选择器
+        // 自定义毛玻璃下拉菜单（解决原生 select 白字配灰白底问题）
+        const curveOptions = [
+            { value: "bezier", text: "声学贝塞尔 S 曲线（推荐）" },
+            { value: "cos", text: "对称正弦 S 曲线 (EaseInOutSine)" },
+            { value: "power", text: "可调幂次曲线 (Power)" },
+            { value: "linear", text: "纯线性 (Linear)" }
+        ];
+
         const curveRow = document.createElement("div");
         curveRow.style.cssText = "display:flex; flex-direction:column; gap:5px;";
         const curveTop = document.createElement("div");
@@ -813,20 +887,37 @@
         curveLabel.textContent = "包络曲线类型 (Envelope Curve)";
         curveLabel.style.fontWeight = "600";
 
-        const curveSelect = document.createElement("select");
-        curveSelect.style.cssText = selectStyle;
-        [
-            { value: "bezier", text: "声学贝塞尔 S 曲线（推荐）" },
-            { value: "cos", text: "对称正弦 S 曲线 (EaseInOutSine)" },
-            { value: "power", text: "可调幂次曲线 (Power)" },
-            { value: "linear", text: "纯线性 (Linear)" }
-        ].forEach((opt) => {
-            const o = document.createElement("option");
-            o.value = opt.value;
-            o.textContent = opt.text;
-            curveSelect.appendChild(o);
-        });
-        curveSelect.value = CONFIG.curveMode;
+        const dropdownWrap = document.createElement("div");
+        dropdownWrap.style.cssText = "position:relative; display:inline-block;";
+
+        const dropdownBtn = document.createElement("button");
+        dropdownBtn.type = "button";
+        dropdownBtn.style.cssText = [
+            "display: flex;",
+            "align-items: center;",
+            "justify-content: space-between;",
+            "gap: 8px;",
+            "min-width: 215px;",
+            "padding: 5px 10px;",
+            "border-radius: 8px;",
+            "border: 1px solid rgba(128, 128, 128, 0.30);",
+            "background: rgba(128, 128, 128, 0.16);",
+            "-webkit-backdrop-filter: blur(12px);",
+            "backdrop-filter: blur(12px);",
+            "color: inherit;",
+            "font-size: 12px;",
+            "cursor: pointer;"
+        ].join("");
+
+        const dropdownBtnText = document.createElement("span");
+        const dropdownArrow = document.createElement("span");
+        dropdownArrow.textContent = "▾";
+        dropdownArrow.style.cssText = "opacity:0.75; font-size:11px;";
+        dropdownBtn.appendChild(dropdownBtnText);
+        dropdownBtn.appendChild(dropdownArrow);
+
+        const dropdownMenu = document.createElement("div");
+        dropdownMenu.style.display = "none";
 
         const curveHint = document.createElement("div");
         curveHint.style.cssText = "font-size:11px; opacity:0.68;";
@@ -839,10 +930,114 @@
             };
             curveHint.textContent = hints[CONFIG.curveMode] || "";
         };
-        updateCurveHint();
 
+        const optionRows = [];
+        const syncCurveDisplay = () => {
+            const matched = curveOptions.find((o) => o.value === CONFIG.curveMode) || curveOptions[0];
+            dropdownBtnText.textContent = matched.text;
+            optionRows.forEach(({ opt, el, checkEl }) => {
+                const active = opt.value === CONFIG.curveMode;
+                checkEl.textContent = active ? "✓" : "";
+                el.style.background = active ? "rgba(128, 128, 128, 0.24)" : "transparent";
+                el.style.fontWeight = active ? "600" : "400";
+            });
+            updateCurveHint();
+        };
+
+        let menuOpen = false;
+        const onOutsidePointerDown = (e) => {
+            if (!root.isConnected) {
+                closeMenu();
+                return;
+            }
+            if (!dropdownWrap.contains(e.target)) {
+                closeMenu();
+            }
+        };
+
+        const closeMenu = () => {
+            if (!menuOpen) return;
+            menuOpen = false;
+            dropdownMenu.style.display = "none";
+            document.removeEventListener("pointerdown", onOutsidePointerDown, true);
+        };
+
+        const openMenu = () => {
+            const lightText = isThemeTextLight(root);
+            dropdownMenu.style.cssText = [
+                "position: absolute;",
+                "top: calc(100% + 6px);",
+                "right: 0;",
+                "min-width: 235px;",
+                "padding: 5px;",
+                "border-radius: 10px;",
+                "z-index: 9999;",
+                "display: flex;",
+                "flex-direction: column;",
+                "gap: 2px;",
+                "-webkit-backdrop-filter: blur(20px) saturate(160%);",
+                "backdrop-filter: blur(20px) saturate(160%);",
+                lightText
+                    ? "background: rgba(24, 26, 34, 0.78); border: 1px solid rgba(255, 255, 255, 0.16); color: rgba(255, 255, 255, 0.94); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);"
+                    : "background: rgba(248, 250, 255, 0.84); border: 1px solid rgba(0, 0, 0, 0.12); color: rgba(24, 26, 32, 0.94); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);"
+            ].join("");
+            menuOpen = true;
+            document.addEventListener("pointerdown", onOutsidePointerDown, true);
+        };
+
+        dropdownBtn.addEventListener("click", () => {
+            if (menuOpen) closeMenu();
+            else openMenu();
+        });
+
+        let syncPowerVisibility = () => {};
+        curveOptions.forEach((opt) => {
+            const item = document.createElement("div");
+            item.style.cssText = [
+                "display: flex;",
+                "align-items: center;",
+                "justify-content: space-between;",
+                "gap: 8px;",
+                "padding: 6px 10px;",
+                "border-radius: 6px;",
+                "font-size: 12px;",
+                "cursor: pointer;",
+                "user-select: none;",
+                "transition: background 0.12s ease;"
+            ].join("");
+
+            const labelSpan = document.createElement("span");
+            labelSpan.textContent = opt.text;
+            const checkEl = document.createElement("span");
+            checkEl.style.cssText = "font-size:12px; width:14px; text-align:center;";
+
+            item.appendChild(labelSpan);
+            item.appendChild(checkEl);
+
+            item.addEventListener("mouseenter", () => {
+                if (opt.value !== CONFIG.curveMode) {
+                    item.style.background = "rgba(128, 128, 128, 0.16)";
+                }
+            });
+            item.addEventListener("mouseleave", () => {
+                item.style.background = opt.value === CONFIG.curveMode ? "rgba(128, 128, 128, 0.24)" : "transparent";
+            });
+            item.addEventListener("click", () => {
+                CONFIG.curveMode = opt.value;
+                saveUserConfig();
+                syncCurveDisplay();
+                syncPowerVisibility();
+                closeMenu();
+            });
+
+            dropdownMenu.appendChild(item);
+            optionRows.push({ opt, el: item, checkEl });
+        });
+
+        dropdownWrap.appendChild(dropdownBtn);
+        dropdownWrap.appendChild(dropdownMenu);
         curveTop.appendChild(curveLabel);
-        curveTop.appendChild(curveSelect);
+        curveTop.appendChild(dropdownWrap);
         curveRow.appendChild(curveTop);
         curveRow.appendChild(curveHint);
         paramCard.appendChild(curveRow);
@@ -857,17 +1052,11 @@
             isFloat: true,
             hint: "1.0 = 线性；2.0~2.5 = 接近人耳对数响度"
         });
-        const syncPowerVisibility = () => {
+        syncPowerVisibility = () => {
             powerCtrl.box.style.opacity = CONFIG.curveMode === "power" ? "1" : "0.48";
         };
+        syncCurveDisplay();
         syncPowerVisibility();
-
-        curveSelect.addEventListener("change", () => {
-            CONFIG.curveMode = VALID_CURVES.has(curveSelect.value) ? curveSelect.value : DEFAULT_CONFIG.curveMode;
-            saveUserConfig();
-            updateCurveHint();
-            syncPowerVisibility();
-        });
 
         paramCard.appendChild(powerCtrl.box);
 
@@ -915,8 +1104,7 @@
             debugCtrl.cb.checked = DEFAULT_CONFIG.debug;
             CONFIG.debug = DEFAULT_CONFIG.debug;
             CONFIG.curveMode = DEFAULT_CONFIG.curveMode;
-            curveSelect.value = DEFAULT_CONFIG.curveMode;
-            updateCurveHint();
+            syncCurveDisplay();
             syncPowerVisibility();
             sliderRefs.fadeOutMs(DEFAULT_CONFIG.fadeOutMs);
             sliderRefs.fadeInMs(DEFAULT_CONFIG.fadeInMs);
@@ -936,11 +1124,15 @@
         root.appendChild(statusCard);
 
         panelStatusUpdater = () => {
-            const sigText = ipcProfile.volSignature
-                ? `已锁定 (${ipcProfile.volSignature.cmd}，标度 0~${ipcProfile.volSignature.scale})`
+            const sig = ipcProfile.volSignature;
+            const sigText = sig
+                ? `已锁定 (${sig.cmd}，标度 0~${sig.scale})`
                 : "未捕获（播放时拖动一次网易云音量条即可自动锁定）";
-            const workerText = workerReady ? "Web Worker 60Hz 已就绪" : "rAF 兜底模式";
-            statusText.textContent = `音量通道：${sigText} ｜ 计时器：${workerText}`;
+            const volText = (userTargetVolume !== null && sig)
+                ? (sig.scale === 1 ? `${Math.round(userTargetVolume * 100)}%` : `${userTargetVolume}%`)
+                : "未知";
+            const workerText = workerReady ? "Worker 60Hz 就绪" : "rAF 兜底";
+            statusText.textContent = `音量通道：${sigText} ｜ 记忆音量：${volText} ｜ 计时：${workerText}`;
         };
         panelStatusUpdater();
 
@@ -1007,29 +1199,56 @@
                     userTargetVolume,
                     actualAnimatedVolume,
                     pendingAction: pendingAction ? pendingAction.type : null,
+                    bootRestorePending,
+                    bootProtectActive,
                     workerReady
                 });
             }
 
-            // 1. 音量 IPC 拦截（PATCH 2）
+            // 1. 音量 IPC 拦截
             const parsedVol = inspectVolumeCall(cmd, args);
             if (parsedVol) {
                 const isFirstLock = !ipcProfile.volSignature;
 
-                if (bootRestorePending && hasRecentUserVolumeGesture()) {
+                if ((bootRestorePending || bootProtectActive) && hasRecentUserVolumeGesture()) {
                     markBootInteracted();
                 }
 
-                // 恢复等待期若非用户主动操作，仅观察真实音量与签名，不覆盖持久化的用户目标音量
-                if (bootRestorePending && !bootUserInteracted) {
+                // 冷启动保护窗内：防备客户端自己归零或错回 100%
+                if (bootProtectActive && !bootUserInteracted && bootRestoreData) {
                     const ret = rawChannelCall.apply(this, args);
                     ipcProfile.volSignature = parsedVol.sig;
                     actualAnimatedVolume = parsedVol.vol;
                     if (isFirstLock) refreshPanelStatus();
+
+                    if (
+                        Math.abs(parsedVol.vol - bootRestoreData.vol) > 1e-4 &&
+                        bootRestoreData.vol > 0 &&
+                        bootAutoReapplyCount < 4
+                    ) {
+                        bootAutoReapplyCount++;
+                        log("拦截到冷启动期间非用户音量漂移，准备反制恢复:", parsedVol.vol, "->", bootRestoreData.vol);
+                        const tId = setTimeout(() => {
+                            bootReapplyTimers.delete(tId);
+                            if (
+                                instanceDisposed ||
+                                !bootProtectActive ||
+                                bootUserInteracted ||
+                                fadeState !== "idle" ||
+                                hasRecentUserVolumeGesture()
+                            ) {
+                                return;
+                            }
+                            callNativeVolume(bootRestoreData.vol);
+                        }, 60);
+                        bootReapplyTimers.add(tId);
+                    } else if (Math.abs(parsedVol.vol - bootRestoreData.vol) < 1e-4) {
+                        commitBootRestore(bootRestoreData.vol);
+                    }
                     return ret;
                 }
 
-                // 用户主动调节音量：先取消旧动画，执行原生 IPC 后再同步状态
+                bootRestorePending = false;
                 if (fadeState === "fadingOut" || fadeState === "fadingIn") {
                     pendingAction = null;
                     stopCurrentAnimation();
@@ -1041,7 +1260,7 @@
                 userTargetVolume = parsedVol.vol;
                 actualAnimatedVolume = parsedVol.vol;
                 saveVolumeState(userTargetVolume, ipcProfile.volSignature, fadeState !== "idle");
-                if (isFirstLock) refreshPanelStatus();
+                refreshPanelStatus();
                 return ret;
             }
 
@@ -1049,7 +1268,7 @@
                 return rawChannelCall.apply(this, args);
             }
 
-            // 2. 拦截暂停（PATCH 1 + PATCH 2 + PATCH 3）
+            // 2. 拦截暂停
             if (/\bpause\b/i.test(cmd) && /audio|player/i.test(cmd)) {
                 if (!flushBootRestoreBeforePlaybackCommand()) {
                     return forwardPlaybackCommand("pause", this, args);
@@ -1099,8 +1318,65 @@
                 return;
             }
 
-            // 3. 拦截播放/恢复（PATCH 1 + PATCH 2 + PATCH 3）
+            // 3. 拦截播放/恢复
             if (/\b(play|resume)\b/i.test(cmd) && /audio|player/i.test(cmd)) {
+                if (fadeState === "idle" && bootRestorePending && !bootUserInteracted && bootRestoreData && bootRestoreData.vol > 0) {
+                    const target = bootRestoreData.vol;
+                    clearBootTimers();
+                    bootProtectActive = false;
+
+                    const scheduleTrackedRestoreCheck = () => {
+                        const tId = setTimeout(() => {
+                            bootReapplyTimers.delete(tId);
+                            if (instanceDisposed || bootUserInteracted || hasRecentUserVolumeGesture()) {
+                                return;
+                            }
+                            if (callNativeVolume(target)) {
+                                commitBootRestore(target);
+                            }
+                        }, 60);
+                        bootReapplyTimers.add(tId);
+                    };
+
+                    if (CONFIG.fadeInMs <= 0) {
+                        const ret = rawChannelCall.apply(this, args);
+                        const okNow = callNativeVolume(target);
+                        if (okNow) {
+                            commitBootRestore(target);
+                        } else {
+                            scheduleTrackedRestoreCheck();
+                        }
+                        return ret;
+                    }
+
+                    if (!callNativeVolume(0)) {
+                        const ret = forwardPlaybackCommand("play", this, args);
+                        scheduleTrackedRestoreCheck();
+                        return ret;
+                    }
+
+                    fadeState = "fadingIn";
+                    let ret;
+                    try {
+                        ret = rawChannelCall.apply(this, args);
+                    } catch (err) {
+                        log("冷启动起播异常，回滚状态:", err);
+                        fadeState = "idle";
+                        callNativeVolume(target);
+                        throw err;
+                    }
+
+                    animateVolume(0, target, CONFIG.fadeInMs, (completed, reason) => {
+                        if (completed) {
+                            fadeState = "idle";
+                            commitBootRestore(target);
+                        } else if (reason !== "cancelled" && fadeState === "fadingIn") {
+                            fadeState = "idle";
+                        }
+                    }, Math.max(CONFIG.resumeDelayMs, 40));
+                    return ret;
+                }
+
                 if (!flushBootRestoreBeforePlaybackCommand()) {
                     return forwardPlaybackCommand("play", this, args);
                 }
@@ -1172,10 +1448,9 @@
         window.addEventListener("beforeunload", onBeforeUnload);
         scheduleBootRestore();
 
-        // PATCH 4：热重载卸载时完成状态收敛并彻底清理监听器
         window.__pauseFadeCleanup = () => {
             clearInterval(bootTimer);
-            clearTimeout(bootRestoreTimer);
+            clearBootTimers();
 
             const oldState = fadeState;
             const oldAction = pendingAction;
@@ -1209,6 +1484,10 @@
                 saveVolumeState(userTargetVolume, ipcProfile.volSignature, false);
             }
 
+            instanceDisposed = true;
+            bootProtectActive = false;
+            clearBootTimers();
+
             destroyWorker();
             panelStatusUpdater = null;
             window.removeEventListener("beforeunload", onBeforeUnload);
@@ -1233,6 +1512,10 @@
     let uiRegistered = registerPluginConfigUI();
 
     bootTimer = setInterval(() => {
+        if (instanceDisposed) {
+            clearInterval(bootTimer);
+            return;
+        }
         if (!uiRegistered) uiRegistered = registerPluginConfigUI();
         if (hookChannel() && uiRegistered) {
             clearInterval(bootTimer);
