@@ -88,7 +88,7 @@ The browser userscript and BetterNCM extension are maintained as separate adapta
 
 ---
 
-## 🎚️ PoFi Pause Fade (`v0.5.2`) — BetterNCM Plugin
+## 🎚️ PoFi Pause Fade — BetterNCM Plugin
 
 > **Acoustic Cubic-Bezier Pause Fade-Out & Resume Fade-In for NetEase Cloud Music.**  
 > **网易云音乐暂停淡出 / 恢复淡入插件（声学贝塞尔 S 曲线 + BetterNCM 可视化调音面板）。**
