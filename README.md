@@ -135,3 +135,11 @@ The browser userscript and BetterNCM extension are maintained as separate adapta
 - **Tested Environment & Maintenance Status / 测试环境与维护声明**：  
   Tested **ONLY** on **NetEase Cloud Music `v2.10.13`**. Provided **As-Is** as a personal Po-Fi utility snapshot—if you run into issues on other client versions, feel free to fork or adapt it freely.  
   仅在 **网易云音乐 `v2.10.13`** 上完成实机测试，按 **As-Is** 现状开源分享，欢迎按需自行 Fork 魔改～
+
+  - **100% Volume on Restart (Known Behavior & Gain-Staging Tip) / 重启后恢复 100% 音量（已知特性与增益建议）**：  
+  In some environments (especially under WASAPI output), pausing and restarting NetEase Cloud Music may cause the client to initialize at **100% volume** regardless of the previous slider position.  
+  在部分环境（尤其是 WASAPI 输出模式）下，暂停后重启网易云客户端时，客户端可能会无视退出前的滑块位置、默认以 **100% 音量** 初始化。  
+  - **For General Users / 习惯直接用网易云调音量的用户**：Please keep an eye on the volume slider after restarting the client to avoid sudden loud playback if you usually listen at a lower software volume (e.g., 20%–50%).  
+    如果你平时习惯把网易云自带音量调得很低（例如 20%～50%），重启客户端后请先留意一下音量条位置，避免直接开播惊吓耳朵。  
+  - **Po-Fi Recommended Setup / Po-Fi 推荐增益架构**：From an audio engineering perspective, keeping both the player and Windows mixer at **100% (Unity Gain)** preserves full digital headroom and avoids unnecessary low-level quantization loss—it is recommended to attenuate listening volume downstream via a physical DAC/amp **potentiometer** or **Equalizer APO (`Preamp`)** instead.  
+    从声学工程角度，本来就更建议将播放器与系统混音器保持在 **100%（Unity Gain 满幅直通）** 以保留完整数字动态与精度，再通过后端的物理**电位器**或 **Equalizer APO（如 `Preamp` 负增益）** 统一控制听音音量。
